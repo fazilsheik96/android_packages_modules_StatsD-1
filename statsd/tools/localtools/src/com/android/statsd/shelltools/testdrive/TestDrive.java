@@ -77,6 +77,9 @@ public class TestDrive {
             "AID_KEYSTORE",
             "AID_VIRTUALIZATIONSERVICE",
             "com.google.android.permissioncontroller",
+            "AID_NFC",
+            "AID_SECURE_ELEMENT",
+            "com.google.android.wearable.media",
     };
     private static final String[] DEFAULT_PULL_SOURCES = {
             "AID_KEYSTORE",
