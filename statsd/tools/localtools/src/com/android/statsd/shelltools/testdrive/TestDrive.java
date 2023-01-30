@@ -81,12 +81,14 @@ public class TestDrive {
             "com.google.android.cellbroadcastreceiver",
             "com.google.android.apps.nexuslauncher",
             "com.google.android.markup",
+            "com.android.art",
+            "com.google.android.art",
             "AID_KEYSTORE",
             "AID_VIRTUALIZATIONSERVICE",
             "com.google.android.permissioncontroller",
             "AID_NFC",
             "AID_SECURE_ELEMENT",
-            "com.google.android.wearable.media",
+            "com.google.android.wearable.media.routing",
     };
     private static final String[] DEFAULT_PULL_SOURCES = {
             "AID_KEYSTORE", "AID_RADIO", "AID_SYSTEM",
