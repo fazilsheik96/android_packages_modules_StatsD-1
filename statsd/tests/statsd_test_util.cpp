@@ -34,6 +34,25 @@ namespace android {
 namespace os {
 namespace statsd {
 
+void StatsServiceConfigTest::sendConfig(const StatsdConfig& config) {
+    string str;
+    config.SerializeToString(&str);
+    std::vector<uint8_t> configAsVec(str.begin(), str.end());
+    service->addConfiguration(kConfigKey, configAsVec, kCallingUid);
+}
+
+ConfigMetricsReport StatsServiceConfigTest::getReports(sp<StatsLogProcessor> processor,
+                                                       int64_t timestamp, bool include_current) {
+    vector<uint8_t> output;
+    ConfigKey configKey(kCallingUid, kConfigKey);
+    processor->onDumpReport(configKey, timestamp, include_current /* include_current_bucket*/,
+                            true /* erase_data */, ADB_DUMP, NO_TIME_CONSTRAINTS, &output);
+    ConfigMetricsReportList reports;
+    reports.ParseFromArray(output.data(), output.size());
+    EXPECT_EQ(1, reports.reports_size());
+    return reports.reports(kCallingUid);
+}
+
 StatsLogReport outputStreamToProto(ProtoOutputStream* proto) {
     vector<uint8_t> bytes;
     bytes.resize(proto->size());
@@ -2068,7 +2087,7 @@ vector<PackageInfo> buildPackageInfos(
     return packageInfos;
 }
 
-StatsdStatsReport_PulledAtomStats getPulledAtomStats() {
+StatsdStatsReport_PulledAtomStats getPulledAtomStats(int32_t atom_id) {
     vector<uint8_t> statsBuffer;
     StatsdStats::getInstance().dumpStats(&statsBuffer, false /*reset stats*/);
     StatsdStatsReport statsReport;
@@ -2079,7 +2098,12 @@ StatsdStatsReport_PulledAtomStats getPulledAtomStats() {
     if (statsReport.pulled_atom_stats_size() == 0) {
         return pulledAtomStats;
     }
-    return statsReport.pulled_atom_stats(0);
+    for (size_t i = 0; i < statsReport.pulled_atom_stats_size(); i++) {
+        if (statsReport.pulled_atom_stats(i).atom_id() == atom_id) {
+            return statsReport.pulled_atom_stats(i);
+        }
+    }
+    return pulledAtomStats;
 }
 
 }  // namespace statsd
