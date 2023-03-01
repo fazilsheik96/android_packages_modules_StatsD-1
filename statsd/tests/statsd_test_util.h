@@ -107,6 +107,9 @@ AtomMatcher CreateStartScheduledJobAtomMatcher();
 // Create AtomMatcher proto for a scheduled job is done.
 AtomMatcher CreateFinishScheduledJobAtomMatcher();
 
+// Create AtomMatcher proto for cancelling a scheduled job.
+AtomMatcher CreateScheduleScheduledJobAtomMatcher();
+
 // Create AtomMatcher proto for screen brightness state changed.
 AtomMatcher CreateScreenBrightnessChangedAtomMatcher();
 
@@ -272,7 +275,7 @@ GaugeMetric createGaugeMetric(const string& name, const int64_t what,
 ValueMetric createValueMetric(const string& name, const AtomMatcher& what, const int valueField,
                               const optional<int64_t>& condition, const vector<int64_t>& states);
 
-KllMetric createKllMetric(const string& name, const AtomMatcher& what, const int valueField,
+KllMetric createKllMetric(const string& name, const AtomMatcher& what, const int kllField,
                           const optional<int64_t>& condition);
 
 Alert createAlert(const string& name, const int64_t metricId, const int buckets,
@@ -378,6 +381,12 @@ std::unique_ptr<LogEvent> CreateFinishScheduledJobEvent(uint64_t timestampNs,
                                                         const vector<string>& attributionTags,
                                                         const string& jobName);
 
+// Create log event when scheduled job schedules.
+std::unique_ptr<LogEvent> CreateScheduleScheduledJobEvent(uint64_t timestampNs,
+                                                          const vector<int>& attributionUids,
+                                                          const vector<string>& attributionTags,
+                                                          const string& jobName);
+
 // Create log event when battery saver starts.
 std::unique_ptr<LogEvent> CreateBatterySaverOnEvent(uint64_t timestampNs);
 // Create log event when battery saver stops.
@@ -440,6 +449,11 @@ std::unique_ptr<LogEvent> CreateAppStartOccurredEvent(
         uint64_t timestampNs, const int uid, const string& pkg_name,
         AppStartOccurred::TransitionType type, const string& activity_name,
         const string& calling_pkg_name, const bool is_instant_app, int64_t activity_start_msec);
+
+std::unique_ptr<LogEvent> CreateBleScanResultReceivedEvent(uint64_t timestampNs,
+                                                           const vector<int>& attributionUids,
+                                                           const vector<string>& attributionTags,
+                                                           const int numResults);
 
 std::unique_ptr<LogEvent> CreateTestAtomReportedEventVariableRepeatedFields(
         uint64_t timestampNs, const vector<int>& repeatedIntField,
@@ -535,9 +549,6 @@ void backfillStringInDimension(const std::map<uint64_t, string>& str_map,
         if (data->has_dimensions_in_what()) {
             backfillStringInDimension(str_map, data->mutable_dimensions_in_what());
         }
-        if (data->has_dimensions_in_condition()) {
-            backfillStringInDimension(str_map, data->mutable_dimensions_in_condition());
-        }
     }
 }
 
@@ -560,20 +571,13 @@ public:
 };
 
 template <typename T>
-void backfillDimensionPath(const DimensionsValue& whatPath,
-                           const DimensionsValue& conditionPath,
-                           T* metricData) {
+void backfillDimensionPath(const DimensionsValue& whatPath, T* metricData) {
     for (int i = 0; i < metricData->data_size(); ++i) {
         auto data = metricData->mutable_data(i);
         if (data->dimension_leaf_values_in_what_size() > 0) {
             backfillDimensionPath(whatPath, data->dimension_leaf_values_in_what(),
                                   data->mutable_dimensions_in_what());
             data->clear_dimension_leaf_values_in_what();
-        }
-        if (data->dimension_leaf_values_in_condition_size() > 0) {
-            backfillDimensionPath(conditionPath, data->dimension_leaf_values_in_condition(),
-                                  data->mutable_dimensions_in_condition());
-            data->clear_dimension_leaf_values_in_condition();
         }
     }
 }
