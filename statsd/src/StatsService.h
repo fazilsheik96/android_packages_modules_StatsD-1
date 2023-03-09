@@ -210,11 +210,22 @@ public:
     virtual Status updateProperties(const std::vector<PropertyParcel>& properties);
 
     /**
-     * Binder call to let clients register the active configs changed operation.
+     * Binder call to let clients register the restricted metrics changed operation for the given
+     * config and calling uid.
      */
     virtual Status setRestrictedMetricsChangedOperation(const int64_t configKey,
                                                         const string& configPackage,
+                                                        const shared_ptr<IPendingIntentRef>& pir,
+                                                        const int32_t callingUid,
                                                         vector<int64_t>* output);
+
+    /**
+     * Binder call to remove the restricted metrics changed operation for the specified config
+     * and calling uid.
+     */
+    virtual Status removeRestrictedMetricsChangedOperation(const int64_t configKey,
+                                                           const string& configPackage,
+                                                           const int32_t callingUid);
 
     /**
      * Binder call to query data in statsd sql store.
@@ -436,7 +447,8 @@ private:
     FRIEND_TEST(PartialBucketE2eTest, TestGaugeMetricWithoutMinPartialBucket);
     FRIEND_TEST(PartialBucketE2eTest, TestGaugeMetricWithMinPartialBucket);
     FRIEND_TEST(PartialBucketE2eTest, TestCountMetricNoSplitByDefault);
-
+    FRIEND_TEST(RestrictedConfigE2ETest, NonRestrictedConfigGetReport);
+    FRIEND_TEST(RestrictedConfigE2ETest, RestrictedConfigNoReport);
     FRIEND_TEST(ConfigUpdateE2eTest, TestAnomalyDurationMetric);
 
     FRIEND_TEST(AnomalyDurationDetectionE2eTest, TestDurationMetric_SUM_single_bucket);

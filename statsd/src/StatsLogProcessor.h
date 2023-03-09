@@ -36,13 +36,15 @@ namespace statsd {
 
 class StatsLogProcessor : public ConfigListener, public virtual PackageInfoListener {
 public:
-    StatsLogProcessor(const sp<UidMap>& uidMap, const sp<StatsPullerManager>& pullerManager,
-                      const sp<AlarmMonitor>& anomalyAlarmMonitor,
-                      const sp<AlarmMonitor>& subscriberTriggerAlarmMonitor,
-                      const int64_t timeBaseNs,
-                      const std::function<bool(const ConfigKey&)>& sendBroadcast,
-                      const std::function<bool(const int&,
-                                               const vector<int64_t>&)>& sendActivationBroadcast);
+    StatsLogProcessor(
+            const sp<UidMap>& uidMap, const sp<StatsPullerManager>& pullerManager,
+            const sp<AlarmMonitor>& anomalyAlarmMonitor,
+            const sp<AlarmMonitor>& subscriberTriggerAlarmMonitor, const int64_t timeBaseNs,
+            const std::function<bool(const ConfigKey&)>& sendBroadcast,
+            const std::function<bool(const int&, const vector<int64_t>&)>& sendActivationBroadcast,
+            const std::function<void(const ConfigKey&, const string&, const vector<int64_t>&)>&
+                    sendRestrictedMetricsBroadcast);
+
     virtual ~StatsLogProcessor();
 
     void OnLogEvent(LogEvent* event);
@@ -107,6 +109,9 @@ public:
     void SetMetadataState(const metadata::StatsMetadataList& statsMetadataList,
                           int64_t currentWallClockTimeNs,
                           int64_t systemElapsedTimeNs);
+
+    /* Enforces ttls for restricted metrics */
+    void EnforceDataTtls(const int64_t wallClockNs, const int64_t elapsedRealtimeNs);
 
     /* Sets the active status/ttl for all configs and metrics to the status in ActiveConfigList. */
     void SetConfigsActiveState(const ActiveConfigList& activeConfigList, int64_t currentTimeNs);
@@ -250,7 +255,7 @@ private:
 
     set<ConfigKey> getRestrictedConfigKeysToQueryLocked(const int32_t callingUid,
                                                         const int64_t configId,
-                                                        const set<int32_t> configPackageUids,
+                                                        const set<int32_t>& configPackageUids,
                                                         string& err);
 
     // Maps the isolated uid in the log event to host uid if the log event contains uid fields.
@@ -296,6 +301,12 @@ private:
     // Function used to send a broadcast so that receiver can be notified of which configs
     // are currently active.
     std::function<bool(const int& uid, const vector<int64_t>& configIds)> mSendActivationBroadcast;
+
+    // Function used to send a broadcast if necessary so the receiver can be notified of the
+    // restricted metrics for the given config.
+    std::function<void(const ConfigKey& key, const string& delegatePackage,
+                       const vector<int64_t>& restrictedMetricIds)>
+            mSendRestrictedMetricsBroadcast;
 
     const int64_t mTimeBaseNs;
 
@@ -353,15 +364,20 @@ private:
     FRIEND_TEST(MetricConditionLinkE2eTest, TestMultiplePredicatesAndLinks2);
     FRIEND_TEST(AttributionE2eTest, TestAttributionMatchAndSliceByFirstUid);
     FRIEND_TEST(AttributionE2eTest, TestAttributionMatchAndSliceByChain);
+    FRIEND_TEST(GaugeMetricE2ePulledTest, TestFirstNSamplesPulledNoTrigger);
+    FRIEND_TEST(GaugeMetricE2ePulledTest, TestFirstNSamplesPulledNoTriggerWithActivation);
     FRIEND_TEST(GaugeMetricE2ePushedTest, TestMultipleFieldsForPushedEvent);
     FRIEND_TEST(GaugeMetricE2ePushedTest, TestRepeatedFieldsForPushedEvent);
     FRIEND_TEST(GaugeMetricE2ePulledTest, TestRandomSamplePulledEvents);
-    FRIEND_TEST(GaugeMetricE2ePulledTest, TestRandomSamplePulledEvents_FIRST_N);
     FRIEND_TEST(GaugeMetricE2ePulledTest, TestRandomSamplePulledEvent_LateAlarm);
     FRIEND_TEST(GaugeMetricE2ePulledTest, TestRandomSamplePulledEventsWithActivation);
     FRIEND_TEST(GaugeMetricE2ePulledTest, TestRandomSamplePulledEventsNoCondition);
     FRIEND_TEST(GaugeMetricE2ePulledTest, TestConditionChangeToTrueSamplePulledEvents);
+    FRIEND_TEST(RestrictedEventMetricE2eTest, TestEnforceTtlRemovesOldEvents);
     FRIEND_TEST(RestrictedEventMetricE2eTest, TestFlagDisabled);
+    FRIEND_TEST(RestrictedEventMetricE2eTest, TestLogEventsEnforceTtls);
+    FRIEND_TEST(RestrictedEventMetricE2eTest, TestQueryEnforceTtls);
+    FRIEND_TEST(RestrictedEventMetricE2eTest, TestLogEventsDoesNotEnforceTtls);
 
     FRIEND_TEST(AnomalyCountDetectionE2eTest, TestSlicedCountMetric_single_bucket);
     FRIEND_TEST(AnomalyCountDetectionE2eTest, TestSlicedCountMetric_multiple_buckets);
