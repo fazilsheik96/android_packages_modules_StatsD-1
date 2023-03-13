@@ -38,6 +38,8 @@ const std::string STATSD_NATIVE_NAMESPACE = "statsd_native";
 const std::string STATSD_NATIVE_BOOT_NAMESPACE = "statsd_native_boot";
 
 const std::string OPTIMIZATION_ATOM_MATCHER_MAP_FLAG = "optimization_atom_matcher_map";
+const std::string LIMIT_PULL_FLAG = "limit_pull";
+const std::string RESTRICTED_METRICS_FLAG = "enable_restricted_metrics";
 
 const std::string FLAG_TRUE = "true";
 const std::string FLAG_FALSE = "false";
@@ -103,6 +105,7 @@ private:
     friend class ConfigUpdateE2eTest;
     friend class ConfigUpdateTest;
     friend class EventMetricE2eTest;
+    friend class ValueMetricE2eTest;
     friend class GaugeMetricE2ePulledTest;
     friend class GaugeMetricE2ePushedTest;
     friend class EventMetricProducerTest;
@@ -112,6 +115,9 @@ private:
     friend class KllMetricE2eAbTest;
     friend class MetricsManagerTest;
     friend class StatsLogProcessorTest;
+    friend class StatsLogProcessorTestRestricted;
+    friend class RestrictedEventMetricProducerTest;
+    friend class RestrictedEventMetricE2eTest;
 
     FRIEND_TEST(ConfigUpdateE2eTest, TestEventMetric);
     FRIEND_TEST(ConfigUpdateE2eTest, TestGaugeMetric);
@@ -127,6 +133,11 @@ private:
     FRIEND_TEST(FlagProviderTest_SPlus_RealValues, TestGetBootFlagBoolServerFlagTrue);
     FRIEND_TEST(FlagProviderTest_SPlus_RealValues, TestGetBootFlagBoolServerFlagFalse);
     FRIEND_TEST(MetricsManagerTest_SPlus, TestAtomMatcherOptimizationEnabledFlag);
+    FRIEND_TEST(MetricsManagerTest_SPlus, TestRestrictedMetricsConfig);
+    FRIEND_TEST(RestrictedEventMetricE2eTest, TestFlagDisabled);
+    FRIEND_TEST(LogEventTest, TestRestrictionCategoryAnnotation);
+    FRIEND_TEST(LogEventTest, TestInvalidRestrictionCategoryAnnotation);
+    FRIEND_TEST(LogEventTest, TestRestrictionCategoryAnnotationFlagDisabled);
 };
 
 }  // namespace statsd

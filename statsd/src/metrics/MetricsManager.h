@@ -58,7 +58,7 @@ public:
 
     bool eventSanityCheck(const LogEvent& event);
 
-    void onLogEvent(const LogEvent& event);
+    virtual void onLogEvent(const LogEvent& event);
 
     void onAnomalyAlarmFired(
         const int64_t& timestampNs,
@@ -82,7 +82,9 @@ public:
     vector<int32_t> getPullAtomUids(int32_t atomId) override;
 
     bool shouldWriteToDisk() const {
-        return mNoReportMetricIds.size() != mAllMetricProducers.size();
+        return mNoReportMetricIds.size() != mAllMetricProducers.size()
+               // Restricted metrics should only be written to dedicated db.
+               && !hasRestrictedMetricsDelegate();
     }
 
     bool shouldPersistLocalHistory() const {
@@ -161,6 +163,15 @@ public:
     void loadMetadata(const metadata::StatsMetadata& metadata,
                       int64_t currentWallClockTimeNs,
                       int64_t systemElapsedTimeNs);
+
+    inline bool hasRestrictedMetricsDelegate() const {
+        return mRestrictedMetricsDelegatePackageName.has_value();
+    }
+
+    void enforceRestrictedDataTtls(const int64_t wallClockNs);
+
+    bool validateRestrictedMetricsDelegate(const int32_t callingUid);
+
 private:
     // For test only.
     inline int64_t getTtlEndNs() const { return mTtlEndNs; }
@@ -319,26 +330,32 @@ private:
     // Hashes of the States used in this config, keyed by the state id, used in config updates.
     std::map<int64_t, uint64_t> mStateProtoHashes;
 
+    // Optional package name of the delegate that processes restricted metrics
+    // If set, restricted metrics are only uploaded to the delegate.
+    optional<string> mRestrictedMetricsDelegatePackageName = nullopt;
+
     FRIEND_TEST(WakelockDurationE2eTest, TestAggregatedPredicateDimensions);
     FRIEND_TEST(MetricConditionLinkE2eTest, TestMultiplePredicatesAndLinks);
     FRIEND_TEST(AttributionE2eTest, TestAttributionMatchAndSliceByFirstUid);
     FRIEND_TEST(AttributionE2eTest, TestAttributionMatchAndSliceByChain);
     FRIEND_TEST(GaugeMetricE2ePushedTest, TestMultipleFieldsForPushedEvent);
     FRIEND_TEST(GaugeMetricE2ePulledTest, TestRandomSamplePulledEvents);
+    FRIEND_TEST(GaugeMetricE2ePulledTest, TestRandomSamplePulledEvents_FIRST_N);
     FRIEND_TEST(GaugeMetricE2ePulledTest, TestRandomSamplePulledEvent_LateAlarm);
     FRIEND_TEST(GaugeMetricE2ePulledTest, TestRandomSamplePulledEventsWithActivation);
     FRIEND_TEST(GaugeMetricE2ePulledTest, TestRandomSamplePulledEventsNoCondition);
     FRIEND_TEST(GaugeMetricE2ePulledTest, TestConditionChangeToTrueSamplePulledEvents);
 
-    FRIEND_TEST(AnomalyDetectionE2eTest, TestSlicedCountMetric_single_bucket);
-    FRIEND_TEST(AnomalyDetectionE2eTest, TestSlicedCountMetric_multiple_buckets);
-    FRIEND_TEST(AnomalyDetectionE2eTest, TestCountMetric_save_refractory_to_disk_no_data_written);
-    FRIEND_TEST(AnomalyDetectionE2eTest, TestCountMetric_save_refractory_to_disk);
-    FRIEND_TEST(AnomalyDetectionE2eTest, TestCountMetric_load_refractory_from_disk);
-    FRIEND_TEST(AnomalyDetectionE2eTest, TestDurationMetric_SUM_single_bucket);
-    FRIEND_TEST(AnomalyDetectionE2eTest, TestDurationMetric_SUM_partial_bucket);
-    FRIEND_TEST(AnomalyDetectionE2eTest, TestDurationMetric_SUM_multiple_buckets);
-    FRIEND_TEST(AnomalyDetectionE2eTest, TestDurationMetric_SUM_long_refractory_period);
+    FRIEND_TEST(AnomalyCountDetectionE2eTest, TestSlicedCountMetric_single_bucket);
+    FRIEND_TEST(AnomalyCountDetectionE2eTest, TestSlicedCountMetric_multiple_buckets);
+    FRIEND_TEST(AnomalyCountDetectionE2eTest,
+                TestCountMetric_save_refractory_to_disk_no_data_written);
+    FRIEND_TEST(AnomalyCountDetectionE2eTest, TestCountMetric_save_refractory_to_disk);
+    FRIEND_TEST(AnomalyCountDetectionE2eTest, TestCountMetric_load_refractory_from_disk);
+    FRIEND_TEST(AnomalyDurationDetectionE2eTest, TestDurationMetric_SUM_single_bucket);
+    FRIEND_TEST(AnomalyDurationDetectionE2eTest, TestDurationMetric_SUM_partial_bucket);
+    FRIEND_TEST(AnomalyDurationDetectionE2eTest, TestDurationMetric_SUM_multiple_buckets);
+    FRIEND_TEST(AnomalyDurationDetectionE2eTest, TestDurationMetric_SUM_long_refractory_period);
 
     FRIEND_TEST(AlarmE2eTest, TestMultipleAlarms);
     FRIEND_TEST(ConfigTtlE2eTest, TestCountMetric);
@@ -351,7 +368,9 @@ private:
 
     FRIEND_TEST(MetricsManagerTest, TestLogSources);
     FRIEND_TEST(MetricsManagerTest, TestLogSourcesOnConfigUpdate);
+    FRIEND_TEST(MetricsManagerTest, TestOnMetricRemoveCalled);
     FRIEND_TEST(MetricsManagerTest_SPlus, TestAtomMatcherOptimizationEnabledFlag);
+    FRIEND_TEST(MetricsManagerTest_SPlus, TestRestrictedMetricsConfig);
     FRIEND_TEST(MetricsManagerUtilTest, TestSampledMetrics);
 
     FRIEND_TEST(StatsLogProcessorTest, TestActiveConfigMetricDiskWriteRead);

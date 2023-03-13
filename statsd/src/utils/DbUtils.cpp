@@ -22,6 +22,7 @@
 
 #include "FieldValue.h"
 #include "android-base/stringprintf.h"
+#include "stats_log_util.h"
 #include "storage/StorageManager.h"
 
 namespace android {
@@ -36,13 +37,21 @@ using ::android::os::statsd::StorageManager;
 using ::android::os::statsd::STRING;
 using base::StringPrintf;
 
+const string TABLE_NAME_PREFIX = "metric_";
+const string COLUMN_NAME_ATOM_TAG = "atomId";
+const string COLUMN_NAME_EVENT_ELAPSED_CLOCK_NS = "elapsedTimestampNs";
+const string COLUMN_NAME_EVENT_WALL_CLOCK_NS = "wallTimestampNs";
+
 static string getDbName(const ConfigKey& key) {
     return StringPrintf("%s/%d_%lld.db", STATS_METADATA_DIR, key.GetUid(), (long long)key.GetId());
 }
 
 static string getCreateSqlString(const int64_t metricId, const LogEvent& event) {
-    string result = StringPrintf("CREATE TABLE IF NOT EXISTS metric_%lld", (long long)metricId);
-    result += "(atomId INTEGER,elapsedTimestampNs INTEGER,wallTimestampNs INTEGER,";
+    string result = StringPrintf("CREATE TABLE IF NOT EXISTS %s%s", TABLE_NAME_PREFIX.c_str(),
+                                 reformatMetricId(metricId).c_str());
+    result += StringPrintf("(%s INTEGER,%s INTEGER,%s INTEGER,", COLUMN_NAME_ATOM_TAG.c_str(),
+                           COLUMN_NAME_EVENT_ELAPSED_CLOCK_NS.c_str(),
+                           COLUMN_NAME_EVENT_WALL_CLOCK_NS.c_str());
     for (size_t fieldId = 1; fieldId <= event.getValues().size(); ++fieldId) {
         const FieldValue& fieldValue = event.getValues()[fieldId - 1];
         if (fieldValue.mField.getDepth() > 0) {
@@ -68,6 +77,11 @@ static string getCreateSqlString(const int64_t metricId, const LogEvent& event) 
     result.pop_back();
     result += ");";
     return result;
+}
+
+string reformatMetricId(const int64_t metricId) {
+    return metricId < 0 ? StringPrintf("n%lld", (long long)metricId * -1)
+                        : StringPrintf("%lld", (long long)metricId);
 }
 
 bool createTableIfNeeded(const ConfigKey& key, const int64_t metricId, const LogEvent& event) {
@@ -112,8 +126,22 @@ void deleteDb(const ConfigKey& key) {
     StorageManager::deleteFile(dbName.c_str());
 }
 
+sqlite3* getDb(const ConfigKey& key) {
+    const string dbName = getDbName(key);
+    sqlite3* db;
+    if (sqlite3_open(dbName.c_str(), &db) == SQLITE_OK) {
+        return db;
+    }
+    return nullptr;
+}
+
+void closeDb(sqlite3* db) {
+    sqlite3_close(db);
+}
+
 static string getInsertSqlString(const int64_t metricId, const vector<LogEvent>& events) {
-    string result = StringPrintf("INSERT INTO metric_%lld VALUES", (long long)metricId);
+    string result =
+            StringPrintf("INSERT INTO metric_%s VALUES", reformatMetricId(metricId).c_str());
     for (auto& logEvent : events) {
         result += StringPrintf("(%d, %lld, %lld,", logEvent.GetTagId(),
                                (long long)logEvent.GetElapsedTimestampNs(),
@@ -156,11 +184,15 @@ bool insert(const ConfigKey& key, const int64_t metricId, const vector<LogEvent>
         sqlite3_close(db);
         return false;
     }
+    bool success = insert(db, metricId, events);
+    sqlite3_close(db);
+    return success;
+}
 
+bool insert(sqlite3* db, const int64_t metricId, const vector<LogEvent>& events) {
     char* error = nullptr;
     string zSql = getInsertSqlString(metricId, events);
     sqlite3_exec(db, zSql.c_str(), nullptr, nullptr, &error);
-    sqlite3_close(db);
     if (error) {
         ALOGW("Failed to insert data to db: %s", error);
         return false;
@@ -169,15 +201,18 @@ bool insert(const ConfigKey& key, const int64_t metricId, const vector<LogEvent>
 }
 
 bool query(const ConfigKey& key, const string& zSql, vector<vector<string>>& rows,
-           vector<int32_t>& columnTypes) {
+           vector<int32_t>& columnTypes, vector<string>& columnNames, string& err) {
     const string dbName = getDbName(key);
     sqlite3* db;
     if (sqlite3_open(dbName.c_str(), &db) != SQLITE_OK) {
+        err = sqlite3_errmsg(db);
         sqlite3_close(db);
         return false;
     }
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, zSql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        err = sqlite3_errmsg(db);
+        sqlite3_finalize(stmt);
         sqlite3_close(db);
         return false;
     }
@@ -189,7 +224,13 @@ bool query(const ConfigKey& key, const string& zSql, vector<vector<string>>& row
         vector<string> rowData(colCount);
         for (int i = 0; i < colCount; ++i) {
             if (firstIter) {
-                columnTypes.push_back(sqlite3_column_type(stmt, i));
+                int32_t columnType = sqlite3_column_type(stmt, i);
+                // Needed to convert to java compatible cursor types. See AbstractCursor#getType()
+                if (columnType == 5) {
+                    columnType = 0;  // Remap 5 (null type) to 0 for java cursor
+                }
+                columnTypes.push_back(columnType);
+                columnNames.push_back(reinterpret_cast<const char*>(sqlite3_column_name(stmt, i)));
             }
             const unsigned char* textResult = sqlite3_column_text(stmt, i);
             string colData = string(reinterpret_cast<const char*>(textResult));
@@ -199,8 +240,25 @@ bool query(const ConfigKey& key, const string& zSql, vector<vector<string>>& row
         firstIter = false;
         result = sqlite3_step(stmt);
     }
-    sqlite3_close(db);
+    sqlite3_finalize(stmt);
     if (result != SQLITE_DONE) {
+        err = sqlite3_errmsg(db);
+        sqlite3_close(db);
+        return false;
+    }
+    sqlite3_close(db);
+    return true;
+}
+
+bool flushTtl(sqlite3* db, const int64_t metricId, const int64_t ttlWallClockNs) {
+    string zSql = StringPrintf("DELETE FROM %s%s WHERE %s <= %lld", TABLE_NAME_PREFIX.c_str(),
+                               reformatMetricId(metricId).c_str(),
+                               COLUMN_NAME_EVENT_WALL_CLOCK_NS.c_str(), (long long)ttlWallClockNs);
+
+    char* error = nullptr;
+    sqlite3_exec(db, zSql.c_str(), nullptr, nullptr, &error);
+    if (error) {
+        ALOGW("Failed to enforce ttl: %s", error);
         return false;
     }
     return true;
