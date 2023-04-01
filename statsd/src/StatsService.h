@@ -20,7 +20,6 @@
 #include <aidl/android/os/BnStatsd.h>
 #include <aidl/android/os/IPendingIntentRef.h>
 #include <aidl/android/os/IPullAtomCallback.h>
-#include <aidl/android/os/StatsPolicyConfigParcel.h>
 #include <aidl/android/util/PropertyParcel.h>
 #include <gtest/gtest_prod.h>
 #include <utils/Looper.h>
@@ -210,17 +209,28 @@ public:
     virtual Status updateProperties(const std::vector<PropertyParcel>& properties);
 
     /**
-     * Binder call to let clients register the active configs changed operation.
+     * Binder call to let clients register the restricted metrics changed operation for the given
+     * config and calling uid.
      */
     virtual Status setRestrictedMetricsChangedOperation(const int64_t configKey,
                                                         const string& configPackage,
+                                                        const shared_ptr<IPendingIntentRef>& pir,
+                                                        const int32_t callingUid,
                                                         vector<int64_t>* output);
+
+    /**
+     * Binder call to remove the restricted metrics changed operation for the specified config
+     * and calling uid.
+     */
+    virtual Status removeRestrictedMetricsChangedOperation(const int64_t configKey,
+                                                           const string& configPackage,
+                                                           const int32_t callingUid);
 
     /**
      * Binder call to query data in statsd sql store.
      */
     virtual Status querySql(const string& sqlQuery, const int32_t minSqlClientVersion,
-                            const aidl::android::os::StatsPolicyConfigParcel& policyConfig,
+                            const optional<vector<uint8_t>>& policyConfig,
                             const shared_ptr<IStatsQueryCallback>& callback,
                             const int64_t configKey, const string& configPackage,
                             const int32_t callingUid);
@@ -436,7 +446,8 @@ private:
     FRIEND_TEST(PartialBucketE2eTest, TestGaugeMetricWithoutMinPartialBucket);
     FRIEND_TEST(PartialBucketE2eTest, TestGaugeMetricWithMinPartialBucket);
     FRIEND_TEST(PartialBucketE2eTest, TestCountMetricNoSplitByDefault);
-
+    FRIEND_TEST(RestrictedConfigE2ETest, NonRestrictedConfigGetReport);
+    FRIEND_TEST(RestrictedConfigE2ETest, RestrictedConfigNoReport);
     FRIEND_TEST(ConfigUpdateE2eTest, TestAnomalyDurationMetric);
 
     FRIEND_TEST(AnomalyDurationDetectionE2eTest, TestDurationMetric_SUM_single_bucket);
