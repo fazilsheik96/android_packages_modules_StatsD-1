@@ -170,6 +170,10 @@ public:
         return hasRestrictedMetricsDelegate() ? mRestrictedMetricsDelegatePackageName.value() : "";
     }
 
+    inline ConfigKey getConfigKey() const {
+        return mConfigKey;
+    }
+
     void enforceRestrictedDataTtls(const int64_t wallClockNs);
 
     bool validateRestrictedMetricsDelegate(const int32_t callingUid);
@@ -234,8 +238,6 @@ private:
     std::list<std::pair<const int64_t, const int32_t>> mAnnotations;
 
     bool mShouldPersistHistory;
-
-    const bool mAtomMatcherOptimizationEnabled;
 
     // All event tags that are interesting to config metrics matchers.
     std::unordered_map<int, std::vector<int>> mTagIdsToMatchersMap;
@@ -377,7 +379,6 @@ private:
     FRIEND_TEST(MetricsManagerTest, TestLogSources);
     FRIEND_TEST(MetricsManagerTest, TestLogSourcesOnConfigUpdate);
     FRIEND_TEST(MetricsManagerTest, TestOnMetricRemoveCalled);
-    FRIEND_TEST(MetricsManagerTest_SPlus, TestAtomMatcherOptimizationEnabledFlag);
     FRIEND_TEST(MetricsManagerTest_SPlus, TestRestrictedMetricsConfig);
     FRIEND_TEST(MetricsManagerUtilTest, TestSampledMetrics);
 

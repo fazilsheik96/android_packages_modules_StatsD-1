@@ -77,7 +77,7 @@ public:
     /* Tells MetricsManager that the alarms in alarmSet have fired. Modifies periodic alarmSet. */
     void onPeriodicAlarmFired(
             const int64_t& timestampNs,
-            unordered_set<sp<const InternalAlarm>, SpHash<InternalAlarm>> alarmSet);
+            unordered_set<sp<const InternalAlarm>, SpHash<InternalAlarm>>& alarmSet);
 
     /* Flushes data to disk. Data on memory will be gone after written to disk. */
     void WriteDataToDisk(const DumpReportReason dumpReportReason, const DumpLatency dumpLatency,
@@ -161,6 +161,9 @@ public:
                   const shared_ptr<aidl::android::os::IStatsQueryCallback>& callback,
                   const int64_t configId, const string& configPackage, const int32_t callingUid);
 
+    void fillRestrictedMetrics(const int64_t configId, const string& configPackage,
+                               const int32_t delegateUid, vector<int64_t>* output);
+
 private:
     // For testing only.
     inline sp<AlarmMonitor> getAnomalyAlarmMonitor() const {
@@ -193,6 +196,9 @@ private:
 
     // Tracks when we last flushed restricted metrics.
     int64_t mLastFlushRestrictedTime;
+
+    // Tracks when we last checked db guardrails.
+    int64_t mLastDbGuardrailEnforcementTime;
 
     // Tracks which config keys has metric reports on disk
     std::set<ConfigKey> mOnDiskDataConfigs;
@@ -252,6 +258,10 @@ private:
     // Enforces ttls on all restricted metrics.
     void enforceDataTtlsLocked(const int64_t wallClockNs, const int64_t elapsedRealtimeNs);
 
+    // Enforces that dbs are within guardrail parameters.
+    void enforceDbGuardrailsIfNecessaryLocked(const int64_t wallClockNs,
+                                              const int64_t elapsedRealtimeNs);
+
     /* Check if we should send a broadcast if approaching memory limits and if we're over, we
      * actually delete the data. */
     void flushIfNecessaryLocked(const ConfigKey& key, MetricsManager& metricsManager);
@@ -295,7 +305,7 @@ private:
     /* Tells MetricsManager that the alarms in alarmSet have fired. Modifies anomaly alarmSet. */
     void processFiredAnomalyAlarmsLocked(
             const int64_t& timestampNs,
-            unordered_set<sp<const InternalAlarm>, SpHash<InternalAlarm>> alarmSet);
+            unordered_set<sp<const InternalAlarm>, SpHash<InternalAlarm>>& alarmSet);
 
     void flushRestrictedDataLocked(const int64_t elapsedRealtimeNs);
 
@@ -391,6 +401,9 @@ private:
     FRIEND_TEST(RestrictedEventMetricE2eTest, TestFlushInWriteDataToDisk);
     FRIEND_TEST(RestrictedEventMetricE2eTest, TestFlushPeriodically);
     FRIEND_TEST(RestrictedEventMetricE2eTest, TestTTlsEnforceDbGuardrails);
+    FRIEND_TEST(RestrictedEventMetricE2eTest, TestOnLogEventMalformedDbNameDeleted);
+    FRIEND_TEST(RestrictedEventMetricE2eTest, TestEnforceDbGuardrails);
+    FRIEND_TEST(RestrictedEventMetricE2eTest, TestEnforceDbGuardrailsDoesNotDeleteBeforeGuardrail);
 
     FRIEND_TEST(AnomalyCountDetectionE2eTest, TestSlicedCountMetric_single_bucket);
     FRIEND_TEST(AnomalyCountDetectionE2eTest, TestSlicedCountMetric_multiple_buckets);

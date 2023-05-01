@@ -16,16 +16,20 @@
 
 #include <vector>
 
+#include "android-base/stringprintf.h"
 #include "flags/FlagProvider.h"
 #include "src/StatsLogProcessor.h"
 #include "src/state/StateTracker.h"
 #include "src/stats_log_util.h"
+#include "src/storage/StorageManager.h"
 #include "stats_annotations.h"
 #include "tests/statsd_test_util.h"
 
 namespace android {
 namespace os {
 namespace statsd {
+
+using base::StringPrintf;
 
 #ifdef __ANDROID__
 
@@ -295,6 +299,34 @@ TEST_F(RestrictedEventMetricE2eTest, TestOneEventMultipleUids) {
                                              ));
 }
 
+TEST_F(RestrictedEventMetricE2eTest, TestOneEventStaticUid) {
+    ConfigKey key2(2000, configId);  // shell uid
+    processor->OnConfigUpdated(configAddedTimeNs + 1 * NS_PER_SEC, key2, config);
+
+    std::vector<std::unique_ptr<LogEvent>> events;
+
+    events.push_back(CreateRestrictedLogEvent(atomTag, configAddedTimeNs + 100));
+
+    // Send log events to StatsLogProcessor.
+    for (auto& event : events) {
+        processor->OnLogEvent(event.get());
+    }
+
+    std::stringstream query;
+    query << "SELECT * FROM metric_" << dbutils::reformatMetricId(restrictedMetricId);
+    processor->querySql(query.str(), /*minSqlClientVersion=*/0,
+                        /*policyConfig=*/{}, mockStatsQueryCallback,
+                        /*configKey=*/configId, /*configPackage=*/"AID_SHELL",
+                        /*callingUid=*/delegate_uid);
+
+    EXPECT_EQ(rowCountResult, 1);
+    EXPECT_THAT(queryDataResult, ElementsAre(to_string(atomTag), to_string(configAddedTimeNs + 100),
+                                             _,  // wallClockNs
+                                             _   // field_1
+                                             ));
+    dbutils::deleteDb(key2);
+}
+
 TEST_F(RestrictedEventMetricE2eTest, TestTooManyConfigsAmbiguousQuery) {
     ConfigKey key2(config_app_uid + 1, configId);
     processor->OnConfigUpdated(configAddedTimeNs + 1 * NS_PER_SEC, key2, config);
@@ -325,6 +357,7 @@ TEST_F(RestrictedEventMetricE2eTest, TestTooManyConfigsAmbiguousQuery) {
                         /*callingUid=*/delegate_uid);
 
     EXPECT_EQ(error, "Ambiguous ConfigKey");
+    dbutils::deleteDb(key2);
 }
 
 TEST_F(RestrictedEventMetricE2eTest, TestUnknownConfigPackage) {
@@ -778,27 +811,78 @@ TEST_F(RestrictedEventMetricE2eTest, TestNotFlushed) {
     EXPECT_EQ(rows.size(), 0);
 }
 
-TEST_F(RestrictedEventMetricE2eTest, TestTTlsEnforceDbGuardrails) {
+TEST_F(RestrictedEventMetricE2eTest, TestEnforceDbGuardrails) {
     int64_t currentWallTimeNs = getWallClockNs();
-    int64_t originalEventElapsedTime = configAddedTimeNs + 100;
-    // 30 min used here because the TTL check period is 1 hour.
-    int64_t newEventElapsedTime = configAddedTimeNs + (3600 * NS_PER_SEC) / 2;  // 30 min later
+    int64_t originalEventElapsedTime =
+            configAddedTimeNs + (3600 * NS_PER_SEC) * 2;  // 2 hours after boot
+    // 2 hours used here because the TTL check period is 1 hour.
+    int64_t dbEnforcementTimeNs =
+            configAddedTimeNs + (3600 * NS_PER_SEC) * 4;  // 4 hours after boot
     std::unique_ptr<LogEvent> event1 = CreateRestrictedLogEvent(atomTag, originalEventElapsedTime);
     event1->setLogdWallClockTimestampNs(currentWallTimeNs);
     // Send log events to StatsLogProcessor.
     processor->OnLogEvent(event1.get(), originalEventElapsedTime);
 
-    processor->enforceDataTtlsLocked(oneMonthLater, originalEventElapsedTime);
-
+    EXPECT_TRUE(StorageManager::hasFile(
+            base::StringPrintf("%s/%s", STATS_RESTRICTED_DATA_DIR, "123_12345.db").c_str()));
     std::stringstream query;
     query << "SELECT * FROM metric_" << dbutils::reformatMetricId(restrictedMetricId);
-    string err;
-    std::vector<int32_t> columnTypes;
-    std::vector<string> columnNames;
-    std::vector<std::vector<std::string>> rows;
-    EXPECT_FALSE(dbutils::query(configKey, query.str(), rows, columnTypes, columnNames, err));
-    EXPECT_EQ(rows.size(), 0);
-    EXPECT_THAT(err, StartsWith("unable to open database file"));
+    processor->querySql(query.str(), /*minSqlClientVersion=*/0,
+                        /*policyConfig=*/{}, mockStatsQueryCallback,
+                        /*configKey=*/configId, /*configPackage=*/config_package_name,
+                        /*callingUid=*/delegate_uid);
+    EXPECT_EQ(rowCountResult, 1);
+    EXPECT_THAT(queryDataResult,
+                ElementsAre(to_string(atomTag), to_string(originalEventElapsedTime),
+                            to_string(currentWallTimeNs),
+                            _  // field_1
+                            ));
+    EXPECT_THAT(columnNamesResult,
+                ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs", "field_1"));
+    EXPECT_THAT(columnTypesResult,
+                ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
+
+    processor->mIsRestrictedMetricsEnabled = false;
+    processor->enforceDbGuardrailsIfNecessaryLocked(oneMonthLater, dbEnforcementTimeNs);
+
+    EXPECT_FALSE(StorageManager::hasFile(
+            base::StringPrintf("%s/%s", STATS_RESTRICTED_DATA_DIR, "123_12345.db").c_str()));
+}
+
+TEST_F(RestrictedEventMetricE2eTest, TestEnforceDbGuardrailsDoesNotDeleteBeforeGuardrail) {
+    int64_t currentWallTimeNs = getWallClockNs();
+    int64_t originalEventElapsedTime =
+            configAddedTimeNs + (3600 * NS_PER_SEC) * 2;  // 2 hours after boot
+    // 2 hours used here because the TTL check period is 1 hour.
+    std::unique_ptr<LogEvent> event1 = CreateRestrictedLogEvent(atomTag, originalEventElapsedTime);
+    event1->setLogdWallClockTimestampNs(currentWallTimeNs);
+    // Send log events to StatsLogProcessor.
+    processor->OnLogEvent(event1.get(), originalEventElapsedTime);
+
+    EXPECT_TRUE(StorageManager::hasFile(
+            base::StringPrintf("%s/%s", STATS_RESTRICTED_DATA_DIR, "123_12345.db").c_str()));
+    std::stringstream query;
+    query << "SELECT * FROM metric_" << dbutils::reformatMetricId(restrictedMetricId);
+    processor->querySql(query.str(), /*minSqlClientVersion=*/0,
+                        /*policyConfig=*/{}, mockStatsQueryCallback,
+                        /*configKey=*/configId, /*configPackage=*/config_package_name,
+                        /*callingUid=*/delegate_uid);
+    EXPECT_EQ(rowCountResult, 1);
+    EXPECT_THAT(queryDataResult,
+                ElementsAre(to_string(atomTag), to_string(originalEventElapsedTime),
+                            to_string(currentWallTimeNs),
+                            _  // field_1
+                            ));
+    EXPECT_THAT(columnNamesResult,
+                ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs", "field_1"));
+    EXPECT_THAT(columnTypesResult,
+                ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
+
+    processor->mIsRestrictedMetricsEnabled = false;
+    processor->enforceDbGuardrailsIfNecessaryLocked(oneMonthLater, originalEventElapsedTime);
+
+    EXPECT_TRUE(StorageManager::hasFile(
+            base::StringPrintf("%s/%s", STATS_RESTRICTED_DATA_DIR, "123_12345.db").c_str()));
 }
 
 TEST_F(RestrictedEventMetricE2eTest, TestFlushInWriteDataToDisk) {
@@ -843,6 +927,25 @@ TEST_F(RestrictedEventMetricE2eTest, TestFlushPeriodically) {
     EXPECT_TRUE(dbutils::query(configKey, query.str(), rows, columnTypes, columnNames, err));
     // Only first event is flushed when second event is logged.
     EXPECT_EQ(rows.size(), 1);
+}
+
+TEST_F(RestrictedEventMetricE2eTest, TestOnLogEventMalformedDbNameDeleted) {
+    vector<string> emptyData;
+    string fileName = StringPrintf("%s/malformedname.db", STATS_RESTRICTED_DATA_DIR);
+    StorageManager::writeFile(fileName.c_str(), emptyData.data(), emptyData.size());
+    EXPECT_TRUE(StorageManager::hasFile(fileName.c_str()));
+    int64_t originalEventElapsedTime = configAddedTimeNs + 100;
+    // 2 hours used here because the TTL check period is 1 hour.
+    int64_t newEventElapsedTime = configAddedTimeNs + 2 * 3600 * NS_PER_SEC + 1;  // 2 hrs later
+    std::unique_ptr<LogEvent> event2 = CreateRestrictedLogEvent(atomTag, newEventElapsedTime);
+    event2->setLogdWallClockTimestampNs(getWallClockNs());
+
+    processor->mLastTtlTime = originalEventElapsedTime;
+    // Send log events to StatsLogProcessor.
+    processor->OnLogEvent(event2.get(), newEventElapsedTime);
+
+    EXPECT_FALSE(StorageManager::hasFile(fileName.c_str()));
+    StorageManager::deleteFile(fileName.c_str());
 }
 
 #else
