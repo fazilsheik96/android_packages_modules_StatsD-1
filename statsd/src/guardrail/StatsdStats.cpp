@@ -60,12 +60,13 @@ const int FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_CONFIG_ID = 2;
 const int FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_CONFIG_UID = 3;
 const int FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_CONFIG_PACKAGE = 4;
 const int FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_INVALID_QUERY_REASON = 5;
-const int FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_QUERY_WALL_TIME_SEC = 6;
+const int FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_QUERY_WALL_TIME_NS = 6;
 const int FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_HAS_ERROR = 7;
 
 const int FIELD_ID_ATOM_STATS_TAG = 1;
 const int FIELD_ID_ATOM_STATS_COUNT = 2;
 const int FIELD_ID_ATOM_STATS_ERROR_COUNT = 3;
+const int FIELD_ID_ATOM_STATS_DROPS_COUNT = 4;
 
 const int FIELD_ID_ANOMALY_ALARMS_REGISTERED = 1;
 const int FIELD_ID_PERIODIC_ALARMS_REGISTERED = 1;
@@ -108,6 +109,7 @@ const int FIELD_ID_CONFIG_STATS_DEACTIVATION = 23;
 const int FIELD_ID_CONFIG_STATS_ANNOTATION_INT64 = 1;
 const int FIELD_ID_CONFIG_STATS_ANNOTATION_INT32 = 2;
 const int FIELD_ID_CONFIG_STATS_RESTRICTED_METRIC_STATS = 25;
+const int FIELD_ID_CONFIG_STATS_DEVICE_INFO_TABLE_CREATION_FAILED = 26;
 
 const int FIELD_ID_INVALID_CONFIG_REASON_ENUM = 1;
 const int FIELD_ID_INVALID_CONFIG_REASON_METRIC_ID = 2;
@@ -286,7 +288,7 @@ void StatsdStats::noteDataDropped(const ConfigKey& key, const size_t totalBytes)
     noteDataDropped(key, totalBytes, getWallClockSec());
 }
 
-void StatsdStats::noteEventQueueOverflow(int64_t oldestEventTimestampNs) {
+void StatsdStats::noteEventQueueOverflow(int64_t oldestEventTimestampNs, int32_t atomId) {
     lock_guard<std::mutex> lock(mLock);
 
     mOverflowCount++;
@@ -299,6 +301,20 @@ void StatsdStats::noteEventQueueOverflow(int64_t oldestEventTimestampNs) {
 
     if (history < mMinQueueHistoryNs) {
         mMinQueueHistoryNs = history;
+    }
+
+    if (atomId < 0) {
+        android_errorWriteLog(0x534e4554, "187957589");
+    }
+
+    noteAtomLoggedLocked(atomId);
+    noteAtomDroppedLocked(atomId);
+}
+
+void StatsdStats::noteAtomDroppedLocked(int32_t atomId) {
+    constexpr int kMaxPushedAtomDroppedStatsSize = kMaxPushedAtomId + kMaxNonPlatformPushedAtoms;
+    if (mPushedAtomDropsStats.size() < kMaxPushedAtomDroppedStatsSize) {
+        mPushedAtomDropsStats[atomId]++;
     }
 }
 
@@ -333,6 +349,16 @@ void StatsdStats::noteMetricsReportSent(const ConfigKey& key, const size_t num_b
         it->second->dump_report_stats.pop_front();
     }
     it->second->dump_report_stats.push_back(std::make_pair(timeSec, num_bytes));
+}
+
+void StatsdStats::noteDeviceInfoTableCreationFailed(const ConfigKey& key) {
+    lock_guard<std::mutex> lock(mLock);
+    auto it = mConfigStats.find(key);
+    if (it == mConfigStats.end()) {
+        ALOGE("Config key %s not found!", key.ToString().c_str());
+        return;
+    }
+    it->second->device_info_table_creation_failed = true;
 }
 
 void StatsdStats::noteUidMapDropped(int deltas) {
@@ -484,9 +510,13 @@ void StatsdStats::notePullExceedMaxDelay(int pullAtomId) {
     mPulledAtomStats[pullAtomId].pullExceedMaxDelay++;
 }
 
-void StatsdStats::noteAtomLogged(int atomId, int32_t timeSec) {
+void StatsdStats::noteAtomLogged(int atomId, int32_t /*timeSec*/) {
     lock_guard<std::mutex> lock(mLock);
 
+    noteAtomLoggedLocked(atomId);
+}
+
+void StatsdStats::noteAtomLoggedLocked(int atomId) {
     if (atomId >= 0 && atomId <= kMaxPushedAtomId) {
         mPushedAtomStats[atomId]++;
     } else {
@@ -620,7 +650,7 @@ void StatsdStats::noteQueryRestrictedMetricSucceed(const int64_t configId,
         mRestrictedMetricQueryStats.pop_front();
     }
     mRestrictedMetricQueryStats.emplace_back(RestrictedMetricQueryStats(
-            callingUid, configId, configPackage, configUid, getWallClockSec()));
+            callingUid, configId, configPackage, configUid, getWallClockNs()));
 }
 
 void StatsdStats::noteQueryRestrictedMetricFailed(const int64_t configId,
@@ -633,7 +663,7 @@ void StatsdStats::noteQueryRestrictedMetricFailed(const int64_t configId,
         mRestrictedMetricQueryStats.pop_front();
     }
     mRestrictedMetricQueryStats.emplace_back(RestrictedMetricQueryStats(
-            callingUid, configId, configPackage, configUid, getWallClockSec(), reason));
+            callingUid, configId, configPackage, configUid, getWallClockNs(), reason));
 }
 
 void StatsdStats::noteRestrictedMetricInsertError(const ConfigKey& configKey,
@@ -730,6 +760,7 @@ void StatsdStats::resetInternalLocked() {
     mAtomMetricStats.clear();
     mActivationBroadcastGuardrailStats.clear();
     mPushedAtomErrorStats.clear();
+    mPushedAtomDropsStats.clear();
     mRestrictedMetricQueryStats.clear();
 }
 
@@ -750,6 +781,15 @@ int StatsdStats::getPushedAtomErrors(int atomId) const {
     }
 }
 
+int StatsdStats::getPushedAtomDrops(int atomId) const {
+    const auto& it = mPushedAtomDropsStats.find(atomId);
+    if (it != mPushedAtomDropsStats.end()) {
+        return it->second;
+    } else {
+        return 0;
+    }
+}
+
 void StatsdStats::dumpStats(int out) const {
     lock_guard<std::mutex> lock(mLock);
     time_t t = mStartTimeSec;
@@ -761,11 +801,12 @@ void StatsdStats::dumpStats(int out) const {
     for (const auto& configStats : mIceBox) {
         dprintf(out,
                 "Config {%d_%lld}: creation=%d, deletion=%d, reset=%d, #metric=%d, #condition=%d, "
-                "#matcher=%d, #alert=%d, valid=%d\n",
+                "#matcher=%d, #alert=%d, valid=%d, device_info_table_creation_failed=%d\n",
                 configStats->uid, (long long)configStats->id, configStats->creation_time_sec,
                 configStats->deletion_time_sec, configStats->reset_time_sec,
                 configStats->metric_count, configStats->condition_count, configStats->matcher_count,
-                configStats->alert_count, configStats->is_valid);
+                configStats->alert_count, configStats->is_valid,
+                configStats->device_info_table_creation_failed);
 
         if (!configStats->is_valid) {
             dprintf(out, "\tinvalid config reason: %s\n",
@@ -963,16 +1004,17 @@ void StatsdStats::dumpStats(int out) const {
         for (const auto& stat : mRestrictedMetricQueryStats) {
             if (stat.mHasError) {
                 dprintf(out,
-                        "Query with error type: %d - %d (query time sec), "
+                        "Query with error type: %d - %lld (query time ns), "
                         "%d (calling uid), %lld (config id), %s (config package)\n",
-                        stat.mInvalidQueryReason.value(), stat.mQueryWallTimeSec, stat.mCallingUid,
-                        (long long)stat.mConfigId, stat.mConfigPackage.c_str());
+                        stat.mInvalidQueryReason.value(), (long long)stat.mQueryWallTimeNs,
+                        stat.mCallingUid, (long long)stat.mConfigId, stat.mConfigPackage.c_str());
             } else {
                 dprintf(out,
-                        "Query succeed - %d (query time sec), %d (calling uid), "
+                        "Query succeed - %lld (query time ns), %d (calling uid), "
                         "%lld (config id), %s (config package), %d (config uid)\n",
-                        stat.mQueryWallTimeSec, stat.mCallingUid, (long long)stat.mConfigId,
-                        stat.mConfigPackage.c_str(), stat.mConfigUid.value());
+                        (long long)stat.mQueryWallTimeNs, stat.mCallingUid,
+                        (long long)stat.mConfigId, stat.mConfigPackage.c_str(),
+                        stat.mConfigUid.value());
             }
         }
     }
@@ -1136,6 +1178,8 @@ void addConfigStatsToProto(const ConfigStats& configStats, ProtoOutputStream* pr
                                  (long long)pair.second.tableDeletionError, proto);
         proto->end(token);
     }
+    proto->write(FIELD_TYPE_BOOL | FIELD_ID_CONFIG_STATS_DEVICE_INFO_TABLE_CREATION_FAILED,
+                 configStats.device_info_table_creation_failed);
     proto->end(token);
 }
 
@@ -1161,9 +1205,13 @@ void StatsdStats::dumpStats(std::vector<uint8_t>* output, bool reset) {
                     proto.start(FIELD_TYPE_MESSAGE | FIELD_ID_ATOM_STATS | FIELD_COUNT_REPEATED);
             proto.write(FIELD_TYPE_INT32 | FIELD_ID_ATOM_STATS_TAG, (int32_t)i);
             proto.write(FIELD_TYPE_INT32 | FIELD_ID_ATOM_STATS_COUNT, mPushedAtomStats[i]);
-            int errors = getPushedAtomErrors(i);
+            const int errors = getPushedAtomErrors(i);
             if (errors > 0) {
                 proto.write(FIELD_TYPE_INT32 | FIELD_ID_ATOM_STATS_ERROR_COUNT, errors);
+            }
+            const int drops = getPushedAtomDrops(i);
+            if (drops > 0) {
+                proto.write(FIELD_TYPE_INT32 | FIELD_ID_ATOM_STATS_DROPS_COUNT, drops);
             }
             proto.end(token);
         }
@@ -1174,9 +1222,13 @@ void StatsdStats::dumpStats(std::vector<uint8_t>* output, bool reset) {
                 proto.start(FIELD_TYPE_MESSAGE | FIELD_ID_ATOM_STATS | FIELD_COUNT_REPEATED);
         proto.write(FIELD_TYPE_INT32 | FIELD_ID_ATOM_STATS_TAG, pair.first);
         proto.write(FIELD_TYPE_INT32 | FIELD_ID_ATOM_STATS_COUNT, pair.second);
-        int errors = getPushedAtomErrors(pair.first);
+        const int errors = getPushedAtomErrors(pair.first);
         if (errors > 0) {
             proto.write(FIELD_TYPE_INT32 | FIELD_ID_ATOM_STATS_ERROR_COUNT, errors);
+        }
+        const int drops = getPushedAtomDrops(pair.first);
+        if (drops > 0) {
+            proto.write(FIELD_TYPE_INT32 | FIELD_ID_ATOM_STATS_DROPS_COUNT, drops);
         }
         proto.end(token);
     }
@@ -1269,8 +1321,8 @@ void StatsdStats::dumpStats(std::vector<uint8_t>* output, bool reset) {
                     FIELD_TYPE_ENUM | FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_INVALID_QUERY_REASON,
                     stat.mInvalidQueryReason.value());
         }
-        proto.write(FIELD_TYPE_INT32 | FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_QUERY_WALL_TIME_SEC,
-                    stat.mQueryWallTimeSec);
+        proto.write(FIELD_TYPE_INT64 | FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_QUERY_WALL_TIME_NS,
+                    stat.mQueryWallTimeNs);
         proto.write(FIELD_TYPE_BOOL | FIELD_ID_RESTRICTED_METRIC_QUERY_STATS_HAS_ERROR,
                     stat.mHasError);
         proto.end(token);
