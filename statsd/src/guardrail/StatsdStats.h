@@ -61,7 +61,8 @@ enum InvalidQueryReason {
     CONFIG_KEY_NOT_FOUND = 4,
     CONFIG_KEY_WITH_UNMATCHED_DELEGATE = 5,
     QUERY_FAILURE = 6,
-    INCONSISTENT_ROW_SIZE = 7
+    INCONSISTENT_ROW_SIZE = 7,
+    NULL_CALLBACK = 8
 };
 
 typedef struct {
@@ -81,6 +82,7 @@ struct ConfigStats {
     int32_t matcher_count;
     int32_t alert_count;
     bool is_valid;
+    bool device_info_table_creation_failed;
 
     // Stores reasons for why config is valid or not
     std::optional<InvalidConfigReason> reason;
@@ -295,6 +297,11 @@ public:
      * The report may be requested via StatsManager API, or through adb cmd.
      */
     void noteMetricsReportSent(const ConfigKey& key, const size_t num_bytes);
+
+    /**
+     * Report failure in creating the device info metadata table for restricted configs.
+     */
+    void noteDeviceInfoTableCreationFailed(const ConfigKey& key);
 
     /**
      * Report the size of output tuple of a condition.
@@ -521,9 +528,9 @@ public:
      */
     void noteBucketUnknownCondition(int64_t metricId);
 
-    /* Reports one event has been dropped due to queue overflow, and the oldest event timestamp in
-     * the queue */
-    void noteEventQueueOverflow(int64_t oldestEventTimestampNs);
+    /* Reports one event id has been dropped due to queue overflow, and the oldest event timestamp
+     * in the queue */
+    void noteEventQueueOverflow(int64_t oldestEventTimestampNs, int32_t atomId);
 
     /**
      * Reports that the activation broadcast guardrail was hit for this uid. Namely, the broadcast
@@ -659,6 +666,10 @@ private:
     // The max size of the map is kMaxNonPlatformPushedAtoms.
     std::unordered_map<int, int> mNonPlatformPushedAtomStats;
 
+    // Stores the number of times a pushed atom is dropped due to queue overflow event.
+    // The max size of the map is kMaxPushedAtomId + kMaxNonPlatformPushedAtoms.
+    std::unordered_map<int, int> mPushedAtomDropsStats;
+
     // Maps PullAtomId to its stats. The size is capped by the puller atom counts.
     std::map<int, PulledAtomStats> mPulledAtomStats;
 
@@ -713,13 +724,13 @@ private:
     struct RestrictedMetricQueryStats {
         RestrictedMetricQueryStats(
                 int32_t callingUid, int64_t configId, const string& configPackage,
-                std::optional<int32_t> configUid, int32_t queryTimeSec,
+                std::optional<int32_t> configUid, int32_t queryTimeNs,
                 std::optional<InvalidQueryReason> invalidQueryReason = std::nullopt)
             : mCallingUid(callingUid),
               mConfigId(configId),
               mConfigPackage(configPackage),
               mConfigUid(configUid),
-              mQueryWallTimeSec(queryTimeSec),
+              mQueryWallTimeNs(queryTimeNs),
               mInvalidQueryReason(invalidQueryReason) {
             mHasError = invalidQueryReason.has_value();
         }
@@ -727,7 +738,7 @@ private:
         int64_t mConfigId;
         string mConfigPackage;
         std::optional<int32_t> mConfigUid;
-        int32_t mQueryWallTimeSec;
+        int64_t mQueryWallTimeNs;
         std::optional<InvalidQueryReason> mInvalidQueryReason;
         bool mHasError;
     };
@@ -746,6 +757,10 @@ private:
 
     void resetInternalLocked();
 
+    void noteAtomLoggedLocked(int atomId);
+
+    void noteAtomDroppedLocked(int atomId);
+
     void noteDataDropped(const ConfigKey& key, const size_t totalBytes, int32_t timeSec);
 
     void noteMetricsReportSent(const ConfigKey& key, const size_t num_bytes, int32_t timeSec);
@@ -759,6 +774,8 @@ private:
     void addToIceBoxLocked(std::shared_ptr<ConfigStats>& stats);
 
     int getPushedAtomErrors(int atomId) const;
+
+    int getPushedAtomDrops(int atomId) const;
 
     /**
      * Get a reference to AtomMetricStats for a metric. If none exists, create it. The reference
@@ -783,6 +800,8 @@ private:
     FRIEND_TEST(StatsdStatsTest, TestAtomErrorStats);
     FRIEND_TEST(StatsdStatsTest, TestRestrictedMetricsStats);
     FRIEND_TEST(StatsdStatsTest, TestRestrictedMetricsQueryStats);
+    FRIEND_TEST(StatsdStatsTest, TestAtomDroppedStats);
+    FRIEND_TEST(StatsdStatsTest, TestAtomDroppedAndLoggedStats);
 
     FRIEND_TEST(StatsLogProcessorTest, InvalidConfigRemoved);
 };
