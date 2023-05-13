@@ -22,6 +22,7 @@
 #include "src/state/StateTracker.h"
 #include "src/stats_log_util.h"
 #include "src/storage/StorageManager.h"
+#include "src/utils/RestrictedPolicyManager.h"
 #include "stats_annotations.h"
 #include "tests/statsd_test_util.h"
 
@@ -180,7 +181,7 @@ TEST_F(RestrictedEventMetricE2eTest, TestInvalidSchemaIncreasingFieldCount) {
     AStatsEvent_addInt32Annotation(statsEvent, ASTATSLOG_ANNOTATION_ID_RESTRICTION_CATEGORY,
                                    ASTATSLOG_RESTRICTION_CATEGORY_DIAGNOSTIC);
     AStatsEvent_overwriteTimestamp(statsEvent, configAddedTimeNs + 200);
-
+    // This event has two extra fields
     AStatsEvent_writeString(statsEvent, "111");
     AStatsEvent_writeInt32(statsEvent, 11);
     AStatsEvent_writeFloat(statsEvent, 11.0);
@@ -227,7 +228,7 @@ TEST_F(RestrictedEventMetricE2eTest, TestInvalidSchemaDecreasingFieldCount) {
     AStatsEvent_addInt32Annotation(statsEvent, ASTATSLOG_ANNOTATION_ID_RESTRICTION_CATEGORY,
                                    ASTATSLOG_RESTRICTION_CATEGORY_DIAGNOSTIC);
     AStatsEvent_overwriteTimestamp(statsEvent, configAddedTimeNs + 100);
-
+    // This event has one extra field.
     AStatsEvent_writeString(statsEvent, "111");
     AStatsEvent_writeInt32(statsEvent, 11);
     std::unique_ptr<LogEvent> logEvent = std::make_unique<LogEvent>(/*uid=*/0, /*pid=*/0);
@@ -262,6 +263,64 @@ TEST_F(RestrictedEventMetricE2eTest, TestInvalidSchemaDecreasingFieldCount) {
     EXPECT_THAT(columnNamesResult, ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs",
                                                "field_1", "field_2"));
 
+    EXPECT_THAT(columnTypesResult, ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER,
+                                               SQLITE_TEXT, SQLITE_INTEGER));
+}
+
+TEST_F(RestrictedEventMetricE2eTest, TestNewMetricSchemaAcrossReboot) {
+    int64_t currentWallTimeNs = getWallClockNs();
+    int64_t originalEventElapsedTime = configAddedTimeNs + 100;
+    std::unique_ptr<LogEvent> event1 = CreateRestrictedLogEvent(atomTag, originalEventElapsedTime);
+    processor->OnLogEvent(event1.get());
+
+    std::stringstream query;
+    query << "SELECT * FROM metric_" << dbutils::reformatMetricId(restrictedMetricId);
+    processor->querySql(query.str(), /*minSqlClientVersion=*/0,
+                        /*policyConfig=*/{}, mockStatsQueryCallback,
+                        /*configKey=*/configId, /*configPackage=*/config_package_name,
+                        /*callingUid=*/delegate_uid);
+    EXPECT_EQ(rowCountResult, 1);
+    EXPECT_THAT(queryDataResult,
+                ElementsAre(to_string(atomTag), to_string(originalEventElapsedTime),
+                            _,  // wallTimestampNs
+                            _   // field_1
+                            ));
+    EXPECT_THAT(columnNamesResult,
+                ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs", "field_1"));
+    EXPECT_THAT(columnTypesResult,
+                ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
+
+    // Create a new processor to simulate a reboot
+    auto processor2 =
+            CreateStatsLogProcessor(/*baseTimeNs=*/0, configAddedTimeNs, config, configKey,
+                                    /*puller=*/nullptr, /*atomTag=*/0, uidMap);
+
+    // Create a restricted event with one extra field.
+    AStatsEvent* statsEvent = AStatsEvent_obtain();
+    AStatsEvent_setAtomId(statsEvent, atomTag);
+    AStatsEvent_addInt32Annotation(statsEvent, ASTATSLOG_ANNOTATION_ID_RESTRICTION_CATEGORY,
+                                   ASTATSLOG_RESTRICTION_CATEGORY_DIAGNOSTIC);
+    AStatsEvent_overwriteTimestamp(statsEvent, originalEventElapsedTime + 100);
+    // This event has one extra field.
+    AStatsEvent_writeString(statsEvent, "111");
+    AStatsEvent_writeInt32(statsEvent, 11);
+    std::unique_ptr<LogEvent> event2 = std::make_unique<LogEvent>(/*uid=*/0, /*pid=*/0);
+    parseStatsEventToLogEvent(statsEvent, event2.get());
+    processor2->OnLogEvent(event2.get());
+
+    processor2->querySql(query.str(), /*minSqlClientVersion=*/0,
+                         /*policyConfig=*/{}, mockStatsQueryCallback,
+                         /*configKey=*/configId, /*configPackage=*/config_package_name,
+                         /*callingUid=*/delegate_uid);
+    EXPECT_EQ(rowCountResult, 1);
+    EXPECT_THAT(queryDataResult,
+                ElementsAre(to_string(atomTag), to_string(originalEventElapsedTime + 100),
+                            _,               // wallTimestampNs
+                            to_string(111),  // field_1
+                            to_string(11)    // field_2
+                            ));
+    EXPECT_THAT(columnNamesResult, ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs",
+                                               "field_1", "field_2"));
     EXPECT_THAT(columnTypesResult, ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER,
                                                SQLITE_TEXT, SQLITE_INTEGER));
 }
@@ -948,6 +1007,137 @@ TEST_F(RestrictedEventMetricE2eTest, TestOnLogEventMalformedDbNameDeleted) {
     StorageManager::deleteFile(fileName.c_str());
 }
 
+TEST_F(RestrictedEventMetricE2eTest, TestRestrictedMetricSavesTtlToDisk) {
+    metadata::StatsMetadataList result;
+    processor->WriteMetadataToProto(getWallClockNs(), configAddedTimeNs, &result);
+
+    ASSERT_EQ(result.stats_metadata_size(), 1);
+    metadata::StatsMetadata statsMetadata = result.stats_metadata(0);
+    EXPECT_EQ(statsMetadata.config_key().config_id(), configId);
+    EXPECT_EQ(statsMetadata.config_key().uid(), config_app_uid);
+
+    ASSERT_EQ(statsMetadata.metric_metadata_size(), 1);
+    metadata::MetricMetadata metricMetadata = statsMetadata.metric_metadata(0);
+    EXPECT_EQ(metricMetadata.metric_id(), restrictedMetricId);
+    EXPECT_EQ(metricMetadata.restricted_category(), CATEGORY_UNKNOWN);
+    result.Clear();
+
+    std::unique_ptr<LogEvent> event = CreateRestrictedLogEvent(atomTag, configAddedTimeNs + 100);
+    processor->OnLogEvent(event.get());
+    processor->WriteMetadataToProto(getWallClockNs(), configAddedTimeNs, &result);
+
+    ASSERT_EQ(result.stats_metadata_size(), 1);
+    statsMetadata = result.stats_metadata(0);
+    EXPECT_EQ(statsMetadata.config_key().config_id(), configId);
+    EXPECT_EQ(statsMetadata.config_key().uid(), config_app_uid);
+
+    ASSERT_EQ(statsMetadata.metric_metadata_size(), 1);
+    metricMetadata = statsMetadata.metric_metadata(0);
+    EXPECT_EQ(metricMetadata.metric_id(), restrictedMetricId);
+    EXPECT_EQ(metricMetadata.restricted_category(), CATEGORY_DIAGNOSTIC);
+}
+
+TEST_F(RestrictedEventMetricE2eTest, TestRestrictedMetricLoadsTtlFromDisk) {
+    int64_t currentWallTimeNs = getWallClockNs();
+    int64_t originalEventElapsedTime = configAddedTimeNs + 100;
+    std::unique_ptr<LogEvent> event1 = CreateRestrictedLogEvent(atomTag, originalEventElapsedTime);
+    event1->setLogdWallClockTimestampNs(eightDaysAgo);
+    processor->OnLogEvent(event1.get(), originalEventElapsedTime);
+    processor->flushRestrictedDataLocked(originalEventElapsedTime);
+    int64_t wallClockNs = 1584991200 * NS_PER_SEC;  // random time
+    int64_t metadataWriteTime = originalEventElapsedTime + 5000 * NS_PER_SEC;
+    processor->SaveMetadataToDisk(wallClockNs, metadataWriteTime);
+
+    std::stringstream query;
+    query << "SELECT * FROM metric_" << dbutils::reformatMetricId(restrictedMetricId);
+    string err;
+    std::vector<int32_t> columnTypes;
+    std::vector<string> columnNames;
+    std::vector<std::vector<std::string>> rows;
+    EXPECT_TRUE(dbutils::query(configKey, query.str(), rows, columnTypes, columnNames, err));
+    ASSERT_EQ(rows.size(), 1);
+    EXPECT_THAT(columnNames,
+                ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs", "field_1"));
+    EXPECT_THAT(columnTypes,
+                ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
+    EXPECT_THAT(rows[0], ElementsAre(to_string(atomTag), to_string(originalEventElapsedTime),
+                                     to_string(eightDaysAgo), _));
+
+    auto processor2 =
+            CreateStatsLogProcessor(/*baseTimeNs=*/0, configAddedTimeNs, config, configKey,
+                                    /*puller=*/nullptr, /*atomTag=*/0, uidMap);
+    // 2 hours used here because the TTL check period is 1 hour.
+    int64_t newEventElapsedTime = configAddedTimeNs + 2 * 3600 * NS_PER_SEC + 1;  // 2 hrs later
+    processor2->LoadMetadataFromDisk(wallClockNs, newEventElapsedTime);
+
+    // Log another event and check that the original TTL is maintained across reboot
+    std::unique_ptr<LogEvent> event2 = CreateRestrictedLogEvent(atomTag, newEventElapsedTime);
+    event2->setLogdWallClockTimestampNs(currentWallTimeNs);
+    processor2->OnLogEvent(event2.get(), newEventElapsedTime);
+    processor2->flushRestrictedDataLocked(newEventElapsedTime);
+
+    columnTypes.clear();
+    columnNames.clear();
+    rows.clear();
+    EXPECT_TRUE(dbutils::query(configKey, query.str(), rows, columnTypes, columnNames, err));
+    ASSERT_EQ(rows.size(), 1);
+    EXPECT_THAT(columnNames,
+                ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs", "field_1"));
+    EXPECT_THAT(columnTypes,
+                ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
+    EXPECT_THAT(rows[0], ElementsAre(to_string(atomTag), to_string(newEventElapsedTime),
+                                     to_string(currentWallTimeNs), _));
+}
+
+TEST_F(RestrictedEventMetricE2eTest, TestNewRestrictionCategoryEventDeletesTable) {
+    int64_t currentWallTimeNs = getWallClockNs();
+    int64_t originalEventElapsedTime = configAddedTimeNs + 100;
+    std::unique_ptr<LogEvent> event1 =
+            CreateNonRestrictedLogEvent(atomTag, originalEventElapsedTime);
+    processor->OnLogEvent(event1.get());
+
+    std::stringstream query;
+    query << "SELECT * FROM metric_" << dbutils::reformatMetricId(restrictedMetricId);
+    processor->querySql(query.str(), /*minSqlClientVersion=*/0,
+                        /*policyConfig=*/{}, mockStatsQueryCallback,
+                        /*configKey=*/configId, /*configPackage=*/config_package_name,
+                        /*callingUid=*/delegate_uid);
+    EXPECT_EQ(rowCountResult, 1);
+    EXPECT_THAT(queryDataResult,
+                ElementsAre(to_string(atomTag), to_string(originalEventElapsedTime),
+                            _,  // wallTimestampNs
+                            _   // field_1
+                            ));
+    EXPECT_THAT(columnNamesResult,
+                ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs", "field_1"));
+    EXPECT_THAT(columnTypesResult,
+                ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
+
+    // Log a second event that will go into the cache
+    std::unique_ptr<LogEvent> event2 =
+            CreateNonRestrictedLogEvent(atomTag, originalEventElapsedTime + 100);
+    processor->OnLogEvent(event2.get());
+
+    // Log a third event with a different category
+    std::unique_ptr<LogEvent> event3 =
+            CreateRestrictedLogEvent(atomTag, originalEventElapsedTime + 200);
+    processor->OnLogEvent(event3.get());
+
+    processor->querySql(query.str(), /*minSqlClientVersion=*/0,
+                        /*policyConfig=*/{}, mockStatsQueryCallback,
+                        /*configKey=*/configId, /*configPackage=*/config_package_name,
+                        /*callingUid=*/delegate_uid);
+    EXPECT_EQ(rowCountResult, 1);
+    EXPECT_THAT(queryDataResult,
+                ElementsAre(to_string(atomTag), to_string(originalEventElapsedTime + 200),
+                            _,  // wallTimestampNs
+                            _   // field_1
+                            ));
+    EXPECT_THAT(columnNamesResult,
+                ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs", "field_1"));
+    EXPECT_THAT(columnTypesResult,
+                ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
+}
 #else
 GTEST_LOG_(INFO) << "This test does nothing.\n";
 #endif
