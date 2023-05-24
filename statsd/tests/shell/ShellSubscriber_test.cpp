@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "frameworks/proto_logging/stats/atoms.pb.h"
+#include "gtest_matchers.h"
 #include "src/shell/shell_config.pb.h"
 #include "src/shell/shell_data.pb.h"
 #include "stats_event.h"
@@ -36,6 +37,7 @@ using android::os::statsd::TestAtomReported;
 using android::os::statsd::TrainExperimentIds;
 using android::os::statsd::util::BytesField;
 using android::os::statsd::util::CPU_ACTIVE_TIME;
+using android::os::statsd::util::PHONE_SIGNAL_STRENGTH_CHANGED;
 using android::os::statsd::util::PLUGGED_STATE_CHANGED;
 using android::os::statsd::util::SCREEN_STATE_CHANGED;
 using android::os::statsd::util::TEST_ATOM_REPORTED;
@@ -186,7 +188,7 @@ void runShellTest(ShellSubscription config, sp<MockUidMap> uidMap,
             actualData.push_back(readData(fds_datas[i][0]));
         }
 
-        EXPECT_THAT(expectedData, UnorderedPointwise(ProtoEq(), actualData));
+        EXPECT_THAT(expectedData, UnorderedPointwise(EqShellData(), actualData));
     }
 
     // Not closing fds_datas[i][0] because this causes writes within ShellSubscriberClient to hang
@@ -243,6 +245,7 @@ protected:
         ShellSubscription config;
         config.add_pushed()->set_atom_id(TEST_ATOM_REPORTED);
         config.add_pushed()->set_atom_id(SCREEN_STATE_CHANGED);
+        config.add_pushed()->set_atom_id(PHONE_SIGNAL_STRENGTH_CHANGED);
         configBytes = protoToBytes(config);
     }
 
@@ -340,7 +343,7 @@ TEST_F(ShellSubscriberCallbackTest, testOverflowCacheIsFlushed) {
     expectedShellData.add_elapsed_timestamp_nanos(1000);
     expectedShellData.add_elapsed_timestamp_nanos(1100);
 
-    EXPECT_THAT(actualShellData, ProtoEq(expectedShellData));
+    EXPECT_THAT(actualShellData, EqShellData(expectedShellData));
 }
 
 TEST_F(ShellSubscriberCallbackTest, testFlushTrigger) {
@@ -365,7 +368,7 @@ TEST_F(ShellSubscriberCallbackTest, testFlushTrigger) {
             ::android::view::DisplayStateEnum::DISPLAY_STATE_ON);
     expectedShellData.add_elapsed_timestamp_nanos(1000);
 
-    EXPECT_THAT(actualShellData, ProtoEq(expectedShellData));
+    EXPECT_THAT(actualShellData, EqShellData(expectedShellData));
 }
 
 TEST_F(ShellSubscriberCallbackTest, testFlushTriggerEmptyCache) {
@@ -384,7 +387,7 @@ TEST_F(ShellSubscriberCallbackTest, testFlushTriggerEmptyCache) {
 
     ShellData expectedShellData;
 
-    EXPECT_THAT(actualShellData, ProtoEq(expectedShellData));
+    EXPECT_THAT(actualShellData, EqShellData(expectedShellData));
 }
 
 TEST_F(ShellSubscriberCallbackTest, testUnsubscribe) {
@@ -409,7 +412,7 @@ TEST_F(ShellSubscriberCallbackTest, testUnsubscribe) {
             ::android::view::DisplayStateEnum::DISPLAY_STATE_ON);
     expectedShellData.add_elapsed_timestamp_nanos(1000);
 
-    EXPECT_THAT(actualShellData, ProtoEq(expectedShellData));
+    EXPECT_THAT(actualShellData, EqShellData(expectedShellData));
 
     // This event is ignored as the subscription has ended.
     shellSubscriber.onLogEvent(*CreateScreenStateChangedEvent(
@@ -435,7 +438,31 @@ TEST_F(ShellSubscriberCallbackTest, testUnsubscribeEmptyCache) {
 
     ShellData expectedShellData;
 
-    EXPECT_THAT(actualShellData, ProtoEq(expectedShellData));
+    EXPECT_THAT(actualShellData, EqShellData(expectedShellData));
+}
+
+TEST_F(ShellSubscriberCallbackTest, testTruncateTimestampAtom) {
+    // Expect callback to be invoked once.
+    EXPECT_CALL(*callback, onSubscriptionData(_, _)).Times(Exactly(1));
+
+    shellSubscriber.startNewSubscription(configBytes, callback);
+
+    shellSubscriber.onLogEvent(*CreatePhoneSignalStrengthChangedEvent(
+            NS_PER_SEC * 5 * 60 + 1000 /*timestamp*/,
+            ::android::telephony::SignalStrengthEnum::SIGNAL_STRENGTH_GOOD));
+
+    shellSubscriber.flushSubscription(callback);
+
+    // Get ShellData proto from the bytes payload of the callback.
+    ShellData actualShellData;
+    ASSERT_TRUE(actualShellData.ParseFromArray(payload.data(), payload.size()));
+
+    ShellData expectedShellData;
+    expectedShellData.add_atom()->mutable_phone_signal_strength_changed()->set_signal_strength(
+            ::android::telephony::SignalStrengthEnum::SIGNAL_STRENGTH_GOOD);
+    expectedShellData.add_elapsed_timestamp_nanos(NS_PER_SEC * 5 * 60);
+
+    EXPECT_THAT(actualShellData, EqShellData(expectedShellData));
 }
 
 TEST_F(ShellSubscriberCallbackPulledTest, testPullIfNeededBeforeInterval) {
@@ -481,7 +508,7 @@ TEST_F(ShellSubscriberCallbackPulledTest, testCachedPullIsFlushed) {
     ShellData actualShellData;
     ASSERT_TRUE(actualShellData.ParseFromArray(payload.data(), payload.size()));
 
-    EXPECT_THAT(actualShellData, ProtoEq(getExpectedPulledData()));
+    EXPECT_THAT(actualShellData, EqShellData(getExpectedPulledData()));
 }
 
 TEST_F(ShellSubscriberCallbackPulledTest, testPullAtCacheTimeout) {
@@ -501,7 +528,7 @@ TEST_F(ShellSubscriberCallbackPulledTest, testPullAtCacheTimeout) {
     ShellData actualShellData;
     ASSERT_TRUE(actualShellData.ParseFromArray(payload.data(), payload.size()));
 
-    EXPECT_THAT(actualShellData, ProtoEq(getExpectedPulledData()));
+    EXPECT_THAT(actualShellData, EqShellData(getExpectedPulledData()));
 }
 
 TEST(ShellSubscriberTest, testPushedSubscription) {
@@ -723,14 +750,14 @@ TEST(ShellSubscriberTest, testDifferentConfigs) {
     expected1.add_atom()->mutable_screen_state_changed()->set_state(
             ::android::view::DisplayStateEnum::DISPLAY_STATE_ON);
     expected1.add_elapsed_timestamp_nanos(pushedList[0]->GetElapsedTimestampNs());
-    EXPECT_THAT(expected1, ProtoEq(actual1));
+    EXPECT_THAT(expected1, EqShellData(actual1));
 
     ShellData actual2 = readData(fds_datas[0][0]);
     ShellData expected2;
     expected2.add_atom()->mutable_screen_state_changed()->set_state(
             ::android::view::DisplayStateEnum::DISPLAY_STATE_OFF);
     expected2.add_elapsed_timestamp_nanos(pushedList[1]->GetElapsedTimestampNs());
-    EXPECT_THAT(expected2, ProtoEq(actual2));
+    EXPECT_THAT(expected2, EqShellData(actual2));
 
     // Validate Config 2, repeating the process
     ShellData actual3 = readData(fds_datas[1][0]);
@@ -738,14 +765,14 @@ TEST(ShellSubscriberTest, testDifferentConfigs) {
     expected3.add_atom()->mutable_plugged_state_changed()->set_state(
             BatteryPluggedStateEnum::BATTERY_PLUGGED_USB);
     expected3.add_elapsed_timestamp_nanos(pushedList[2]->GetElapsedTimestampNs());
-    EXPECT_THAT(expected3, ProtoEq(actual3));
+    EXPECT_THAT(expected3, EqShellData(actual3));
 
     ShellData actual4 = readData(fds_datas[1][0]);
     ShellData expected4;
     expected4.add_atom()->mutable_plugged_state_changed()->set_state(
             BatteryPluggedStateEnum::BATTERY_PLUGGED_NONE);
     expected4.add_elapsed_timestamp_nanos(pushedList[3]->GetElapsedTimestampNs());
-    EXPECT_THAT(expected4, ProtoEq(actual4));
+    EXPECT_THAT(expected4, EqShellData(actual4));
 
     // Not closing fds_datas[i][0] because this causes writes within ShellSubscriberClient to hang
 }
