@@ -49,7 +49,7 @@ ConfigMetricsReport StatsServiceConfigTest::getReports(sp<StatsLogProcessor> pro
     ConfigMetricsReportList reports;
     reports.ParseFromArray(output.data(), output.size());
     EXPECT_EQ(1, reports.reports_size());
-    return reports.reports(kCallingUid);
+    return reports.reports(0);
 }
 
 StatsLogReport outputStreamToProto(ProtoOutputStream* proto) {
@@ -1378,6 +1378,19 @@ std::unique_ptr<LogEvent> CreateNonRestrictedLogEvent(int atomTag, int64_t times
     AStatsEvent_setAtomId(statsEvent, atomTag);
     AStatsEvent_writeInt32(statsEvent, 10);
     AStatsEvent_overwriteTimestamp(statsEvent, timestampNs);
+    std::unique_ptr<LogEvent> logEvent = std::make_unique<LogEvent>(/*uid=*/0, /*pid=*/0);
+    parseStatsEventToLogEvent(statsEvent, logEvent.get());
+    return logEvent;
+}
+
+std::unique_ptr<LogEvent> CreatePhoneSignalStrengthChangedEvent(
+        int64_t timestampNs, ::telephony::SignalStrengthEnum state) {
+    AStatsEvent* statsEvent = AStatsEvent_obtain();
+    AStatsEvent_setAtomId(statsEvent, util::PHONE_SIGNAL_STRENGTH_CHANGED);
+    AStatsEvent_addBoolAnnotation(statsEvent, ASTATSLOG_ANNOTATION_ID_TRUNCATE_TIMESTAMP, true);
+    AStatsEvent_overwriteTimestamp(statsEvent, timestampNs);
+    AStatsEvent_writeInt32(statsEvent, state);
+
     std::unique_ptr<LogEvent> logEvent = std::make_unique<LogEvent>(/*uid=*/0, /*pid=*/0);
     parseStatsEventToLogEvent(statsEvent, logEvent.get());
     return logEvent;
