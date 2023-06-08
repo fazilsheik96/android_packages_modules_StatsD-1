@@ -21,6 +21,8 @@
 
 #include <android-base/file.h>
 #include <android-base/strings.h>
+#include <android-modules-utils/sdk_level.h>
+#include <android/binder_ibinder_platform.h>
 #include <cutils/multiuser.h>
 #include <private/android_filesystem_config.h>
 #include <src/statsd_config.pb.h>
@@ -45,6 +47,7 @@
 using namespace android;
 
 using android::base::StringPrintf;
+using android::modules::sdklevel::IsAtLeastU;
 using android::util::FIELD_COUNT_REPEATED;
 using android::util::FIELD_TYPE_MESSAGE;
 
@@ -56,7 +59,7 @@ namespace statsd {
 
 constexpr const char* kPermissionDump = "android.permission.DUMP";
 
-constexpr const char* kPermissionReadLogs = "android.permission.READ_LOGS";
+constexpr const char* kTracedProbesSid = "u:r:traced_probes:s0";
 
 constexpr const char* kPermissionRegisterPullAtom = "android.permission.REGISTER_STATS_PULL_ATOM";
 
@@ -93,6 +96,34 @@ Status checkUid(uid_t expectedUid) {
     }                                                             \
 }
 
+Status checkSid(const char* expectedSid) {
+    const char* sid = nullptr;
+    if (__builtin_available(android __ANDROID_API_U__, *)) {
+        sid = AIBinder_getCallingSid();
+    }
+
+    // root (which is the uid in tests for example) has all permissions.
+    uid_t uid = AIBinder_getCallingUid();
+    if (uid == AID_ROOT) {
+        return Status::ok();
+    }
+
+    if (sid != nullptr && strcmp(expectedSid, sid) == 0) {
+        return Status::ok();
+    } else {
+        return exception(EX_SECURITY,
+                         StringPrintf("SID '%s' is not expected SID '%s'", sid, expectedSid));
+    }
+}
+
+#define ENFORCE_SID(sid)                 \
+    {                                    \
+        Status status = checkSid((sid)); \
+        if (!status.isOk()) {            \
+            return status;               \
+        }                                \
+    }
+
 StatsService::StatsService(const sp<UidMap>& uidMap, shared_ptr<LogEventQueue> queue)
     : mUidMap(uidMap),
       mAnomalyAlarmMonitor(new AlarmMonitor(
@@ -119,7 +150,7 @@ StatsService::StatsService(const sp<UidMap>& uidMap, shared_ptr<LogEventQueue> q
                       StatsdStats::getInstance().noteRegisteredPeriodicAlarmChanged();
                   }
               })),
-      mEventQueue(queue),
+      mEventQueue(std::move(queue)),
       mBootCompleteTrigger({kBootCompleteTag, kUidMapReceivedTag, kAllPullersRegisteredTag},
                            [this]() { mProcessor->onStatsdInitCompleted(getElapsedRealtimeNs()); }),
       mStatsCompanionServiceDeathRecipient(
@@ -1328,11 +1359,8 @@ Status StatsService::getRegisteredExperimentIds(std::vector<int64_t>* experiment
 Status StatsService::updateProperties(const vector<PropertyParcel>& properties) {
     ENFORCE_UID(AID_SYSTEM);
 
-    for (const auto& [property, value] : properties) {
-        if (property == kIncludeCertificateHash) {
-            mUidMap->setIncludeCertificateHash(value == "true");
-        }
-    }
+    // TODO(b/281765292): Forward statsd_java properties received here to FlagProvider.
+
     return Status::ok();
 }
 
@@ -1376,7 +1404,8 @@ Status StatsService::setRestrictedMetricsChangedOperation(const int64_t configId
                                                           const int32_t callingUid,
                                                           vector<int64_t>* output) {
     ENFORCE_UID(AID_SYSTEM);
-    if (!FlagProvider::getInstance().getBootFlagBool(RESTRICTED_METRICS_FLAG, FLAG_FALSE)) {
+    if (!IsAtLeastU()) {
+        ALOGW("setRestrictedMetricsChangedOperation invoked on U- device");
         return Status::ok();
     }
     mConfigManager->SetRestrictedMetricsChangedReceiver(configPackage, configId, callingUid, pir);
@@ -1392,7 +1421,8 @@ Status StatsService::removeRestrictedMetricsChangedOperation(const int64_t confi
                                                              const string& configPackage,
                                                              const int32_t callingUid) {
     ENFORCE_UID(AID_SYSTEM);
-    if (!FlagProvider::getInstance().getBootFlagBool(RESTRICTED_METRICS_FLAG, FLAG_FALSE)) {
+    if (!IsAtLeastU()) {
+        ALOGW("removeRestrictedMetricsChangedOperation invoked on U- device");
         return Status::ok();
     }
     mConfigManager->RemoveRestrictedMetricsChangedReceiver(configPackage, configId, callingUid);
@@ -1405,6 +1435,13 @@ Status StatsService::querySql(const string& sqlQuery, const int32_t minSqlClient
                               const int64_t configKey, const string& configPackage,
                               const int32_t callingUid) {
     ENFORCE_UID(AID_SYSTEM);
+    if (callback == nullptr) {
+        ALOGW("querySql called with null callback.");
+        StatsdStats::getInstance().noteQueryRestrictedMetricFailed(
+                configKey, configPackage, std::nullopt, callingUid,
+                InvalidQueryReason(NULL_CALLBACK));
+        return Status::ok();
+    }
     mProcessor->querySql(sqlQuery, minSqlClientVersion, policyConfig, callback, configKey,
                          configPackage, callingUid);
     return Status::ok();
@@ -1412,14 +1449,8 @@ Status StatsService::querySql(const string& sqlQuery, const int32_t minSqlClient
 
 Status StatsService::addSubscription(const vector<uint8_t>& subscriptionConfig,
                                      const shared_ptr<IStatsSubscriptionCallback>& callback) {
-    ENFORCE_UID(AID_NOBODY);
-    if (!checkPermission(kPermissionReadLogs)) {
-        return exception(
-                EX_SECURITY,
-                StringPrintf(
-                        "Uid %d does not have the %s permission when subscribing to atom events",
-                        AIBinder_getCallingUid(), kPermissionReadLogs));
-    }
+    ENFORCE_SID(kTracedProbesSid);
+
     initShellSubscriber();
 
     mShellSubscriber->startNewSubscription(subscriptionConfig, callback);
@@ -1428,12 +1459,8 @@ Status StatsService::addSubscription(const vector<uint8_t>& subscriptionConfig,
 }
 
 Status StatsService::removeSubscription(const shared_ptr<IStatsSubscriptionCallback>& callback) {
-    ENFORCE_UID(AID_NOBODY);
-    if (!checkPermission(kPermissionReadLogs)) {
-        return exception(EX_SECURITY, StringPrintf("Uid %d does not have the %s permission when "
-                                                   "unsubscribing from atom events",
-                                                   AIBinder_getCallingUid(), kPermissionReadLogs));
-    }
+    ENFORCE_SID(kTracedProbesSid);
+
     if (mShellSubscriber != nullptr) {
         mShellSubscriber->unsubscribe(callback);
     }
@@ -1441,12 +1468,8 @@ Status StatsService::removeSubscription(const shared_ptr<IStatsSubscriptionCallb
 }
 
 Status StatsService::flushSubscription(const shared_ptr<IStatsSubscriptionCallback>& callback) {
-    ENFORCE_UID(AID_NOBODY);
-    if (!checkPermission(kPermissionReadLogs)) {
-        return exception(EX_SECURITY, StringPrintf("Uid %d does not have the %s permission when "
-                                                   "flushing an atoms subscription",
-                                                   AIBinder_getCallingUid(), kPermissionReadLogs));
-    }
+    ENFORCE_SID(kTracedProbesSid);
+
     if (mShellSubscriber != nullptr) {
         mShellSubscriber->flushSubscription(callback);
     }

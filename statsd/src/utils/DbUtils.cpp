@@ -20,7 +20,10 @@
 
 #include "utils/DbUtils.h"
 
+#include <android/api-level.h>
+
 #include "FieldValue.h"
+#include "android-base/properties.h"
 #include "android-base/stringprintf.h"
 #include "stats_log_util.h"
 #include "storage/StorageManager.h"
@@ -35,12 +38,24 @@ using ::android::os::statsd::INT;
 using ::android::os::statsd::LONG;
 using ::android::os::statsd::StorageManager;
 using ::android::os::statsd::STRING;
+using base::GetProperty;
 using base::StringPrintf;
 
 const string TABLE_NAME_PREFIX = "metric_";
 const string COLUMN_NAME_ATOM_TAG = "atomId";
 const string COLUMN_NAME_EVENT_ELAPSED_CLOCK_NS = "elapsedTimestampNs";
 const string COLUMN_NAME_EVENT_WALL_CLOCK_NS = "wallTimestampNs";
+
+const string COLUMN_NAME_SDK_VERSION = "sdkVersion";
+const string COLUMN_NAME_MODEL = "model";
+const string COLUMN_NAME_PRODUCT = "product";
+const string COLUMN_NAME_HARDWARE = "hardware";
+const string COLUMN_NAME_DEVICE = "device";
+const string COLUMN_NAME_BUILD = "osBuild";
+const string COLUMN_NAME_FINGERPRINT = "fingerprint";
+const string COLUMN_NAME_BRAND = "brand";
+const string COLUMN_NAME_MANUFACTURER = "manufacturer";
+const string COLUMN_NAME_BOARD = "board";
 
 static std::vector<std::string> getExpectedTableSchema(const LogEvent& logEvent) {
     vector<std::string> result;
@@ -110,7 +125,7 @@ static string getCreateSqlString(const int64_t metricId, const LogEvent& event) 
         }
     }
     result.pop_back();
-    result += ");";
+    result += ") STRICT;";
     return result;
 }
 
@@ -372,7 +387,7 @@ void verifyIntegrityAndDeleteIfNecessary(const ConfigKey& configKey) {
     char* error = nullptr;
     sqlite3_exec(db, zSql.c_str(), integrityCheckCallback, nullptr, &error);
     if (error) {
-        // TODO(b/268150038): Add statsdstats reporting.
+        StatsdStats::getInstance().noteDbCorrupted(configKey);
         ALOGW("Integrity Check failed %s", error);
         sqlite3_close(db);
         deleteDb(configKey);
@@ -381,6 +396,106 @@ void verifyIntegrityAndDeleteIfNecessary(const ConfigKey& configKey) {
     sqlite3_close(db);
 }
 
+static bool getDeviceInfoInsertStmt(sqlite3* db, sqlite3_stmt** stmt, string error) {
+    string insertSql = StringPrintf("INSERT INTO device_info VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    if (sqlite3_prepare_v2(db, insertSql.c_str(), -1, stmt, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(db);
+        return false;
+    }
+
+    // ? parameters start with an index of 1 from start of query string to the end.
+    int32_t index = 1;
+
+    int32_t sdkVersion = android_get_device_api_level();
+    sqlite3_bind_int(*stmt, index, sdkVersion);
+    ++index;
+
+    string model = GetProperty("ro.product.model", "(unknown)");
+    sqlite3_bind_text(*stmt, index, model.c_str(), -1, SQLITE_TRANSIENT);
+    ++index;
+
+    string product = GetProperty("ro.product.name", "(unknown)");
+    sqlite3_bind_text(*stmt, index, product.c_str(), -1, SQLITE_TRANSIENT);
+    ++index;
+
+    string hardware = GetProperty("ro.hardware", "(unknown)");
+    sqlite3_bind_text(*stmt, index, hardware.c_str(), -1, SQLITE_TRANSIENT);
+    ++index;
+
+    string device = GetProperty("ro.product.device", "(unknown)");
+    sqlite3_bind_text(*stmt, index, device.c_str(), -1, SQLITE_TRANSIENT);
+    ++index;
+
+    string osBuild = GetProperty("ro.build.id", "(unknown)");
+    sqlite3_bind_text(*stmt, index, osBuild.c_str(), -1, SQLITE_TRANSIENT);
+    ++index;
+
+    string fingerprint = GetProperty("ro.build.fingerprint", "(unknown)");
+    sqlite3_bind_text(*stmt, index, fingerprint.c_str(), -1, SQLITE_TRANSIENT);
+    ++index;
+
+    string brand = GetProperty("ro.product.brand", "(unknown)");
+    sqlite3_bind_text(*stmt, index, brand.c_str(), -1, SQLITE_TRANSIENT);
+    ++index;
+
+    string manufacturer = GetProperty("ro.product.manufacturer", "(unknown)");
+    sqlite3_bind_text(*stmt, index, manufacturer.c_str(), -1, SQLITE_TRANSIENT);
+    ++index;
+
+    string board = GetProperty("ro.product.board", "(unknown)");
+    sqlite3_bind_text(*stmt, index, board.c_str(), -1, SQLITE_TRANSIENT);
+    ++index;
+
+    return true;
+}
+
+bool updateDeviceInfoTable(const ConfigKey& key, string& error) {
+    const string dbName = getDbName(key);
+    sqlite3* db;
+    if (sqlite3_open(dbName.c_str(), &db) != SQLITE_OK) {
+        error = sqlite3_errmsg(db);
+        sqlite3_close(db);
+        return false;
+    }
+
+    string dropTableSql = "DROP TABLE device_info";
+    // Ignore possible error result code if table has not yet been created.
+    sqlite3_exec(db, dropTableSql.c_str(), nullptr, nullptr, nullptr);
+
+    string createTableSql = StringPrintf(
+            "CREATE TABLE device_info(%s INTEGER, %s TEXT, %s TEXT, %s TEXT, %s TEXT, %s TEXT, %s "
+            "TEXT, %s TEXT, %s TEXT, %s TEXT) "
+            "STRICT",
+            COLUMN_NAME_SDK_VERSION.c_str(), COLUMN_NAME_MODEL.c_str(), COLUMN_NAME_PRODUCT.c_str(),
+            COLUMN_NAME_HARDWARE.c_str(), COLUMN_NAME_DEVICE.c_str(), COLUMN_NAME_BUILD.c_str(),
+            COLUMN_NAME_FINGERPRINT.c_str(), COLUMN_NAME_BRAND.c_str(),
+            COLUMN_NAME_MANUFACTURER.c_str(), COLUMN_NAME_BOARD.c_str());
+    if (sqlite3_exec(db, createTableSql.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(db);
+        ALOGW("Failed to create device info table %s", error.c_str());
+        sqlite3_close(db);
+        return false;
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    if (!getDeviceInfoInsertStmt(db, &stmt, error)) {
+        ALOGW("Failed to generate device info prepared sql insert query %s", error.c_str());
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return false;
+    }
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        error = sqlite3_errmsg(db);
+        ALOGW("Failed to insert data to device info table: %s", error.c_str());
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return false;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return true;
+}
 }  // namespace dbutils
 }  // namespace statsd
 }  // namespace os

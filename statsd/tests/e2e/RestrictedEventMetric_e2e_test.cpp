@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <android-modules-utils/sdk_level.h>
 #include <gtest/gtest.h>
 
 #include <vector>
@@ -30,6 +31,7 @@ namespace android {
 namespace os {
 namespace statsd {
 
+using android::modules::sdklevel::IsAtLeastU;
 using base::StringPrintf;
 
 #ifdef __ANDROID__
@@ -64,9 +66,9 @@ protected:
 
 private:
     void SetUp() override {
-        FlagProvider::getInstance().overrideFuncs(&isAtLeastSFuncTrue);
-        FlagProvider::getInstance().overrideFlag(RESTRICTED_METRICS_FLAG, FLAG_TRUE,
-                                                 /*isBootFlag=*/true);
+        if (!IsAtLeastU()) {
+            GTEST_SKIP();
+        }
 
         mockStatsQueryCallback = SharedRefBase::make<StrictMock<MockStatsQueryCallback>>();
         EXPECT_CALL(*mockStatsQueryCallback, sendResults(_, _, _, _))
@@ -265,6 +267,49 @@ TEST_F(RestrictedEventMetricE2eTest, TestInvalidSchemaDecreasingFieldCount) {
 
     EXPECT_THAT(columnTypesResult, ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER,
                                                SQLITE_TEXT, SQLITE_INTEGER));
+}
+
+TEST_F(RestrictedEventMetricE2eTest, TestInvalidSchemaDifferentFieldType) {
+    std::vector<std::unique_ptr<LogEvent>> events;
+
+    AStatsEvent* statsEvent = AStatsEvent_obtain();
+    AStatsEvent_setAtomId(statsEvent, atomTag);
+    AStatsEvent_addInt32Annotation(statsEvent, ASTATSLOG_ANNOTATION_ID_RESTRICTION_CATEGORY,
+                                   ASTATSLOG_RESTRICTION_CATEGORY_DIAGNOSTIC);
+    AStatsEvent_overwriteTimestamp(statsEvent, configAddedTimeNs + 200);
+    // This event has a string instead of an int field
+    AStatsEvent_writeString(statsEvent, "test_string");
+    std::unique_ptr<LogEvent> logEvent = std::make_unique<LogEvent>(/*uid=*/0, /*pid=*/0);
+    parseStatsEventToLogEvent(statsEvent, logEvent.get());
+
+    events.push_back(CreateRestrictedLogEvent(atomTag, configAddedTimeNs + 100));
+    events.push_back(std::move(logEvent));
+
+    // Send log events to StatsLogProcessor.
+    for (auto& event : events) {
+        processor->OnLogEvent(event.get());
+        processor->WriteDataToDisk(DEVICE_SHUTDOWN, FAST,
+                                   event->GetElapsedTimestampNs() + 20 * NS_PER_SEC,
+                                   getWallClockNs());
+    }
+
+    std::stringstream query;
+    query << "SELECT * FROM metric_" << dbutils::reformatMetricId(restrictedMetricId);
+    processor->querySql(query.str(), /*minSqlClientVersion=*/0,
+                        /*policyConfig=*/{}, mockStatsQueryCallback,
+                        /*configKey=*/configId, /*configPackage=*/config_package_name,
+                        /*callingUid=*/delegate_uid);
+
+    EXPECT_EQ(rowCountResult, 1);
+    // Event 2 rejected.
+    EXPECT_THAT(queryDataResult, ElementsAre(to_string(atomTag), to_string(configAddedTimeNs + 100),
+                                             _,  // wallClockNs
+                                             _   // field_1
+                                             ));
+    EXPECT_THAT(columnNamesResult,
+                ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs", "field_1"));
+    EXPECT_THAT(columnTypesResult,
+                ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
 }
 
 TEST_F(RestrictedEventMetricE2eTest, TestNewMetricSchemaAcrossReboot) {
@@ -490,19 +535,6 @@ TEST_F(RestrictedEventMetricE2eTest, TestInvalidQuery) {
     EXPECT_THAT(error, StartsWith("failed to query db"));
 }
 
-TEST_F(RestrictedEventMetricE2eTest, TestFlagDisabled) {
-    processor->mIsRestrictedMetricsEnabled = false;
-
-    std::stringstream query;
-    query << "SELECT * FROM metric_" << dbutils::reformatMetricId(restrictedMetricId);
-    processor->querySql(query.str(), /*minSqlClientVersion=*/0,
-                        /*policyConfig=*/{}, mockStatsQueryCallback,
-                        /*configKey=*/configId, /*configPackage=*/config_package_name,
-                        /*callingUid=*/delegate_uid);
-
-    EXPECT_EQ(error, "Restricted metrics are not enabled");
-}
-
 TEST_F(RestrictedEventMetricE2eTest, TestEnforceTtlRemovesOldEvents) {
     int64_t currentWallTimeNs = getWallClockNs();
     // 8 days are used here because the TTL threshold is 7 days.
@@ -622,7 +654,7 @@ TEST_F(RestrictedEventMetricE2eTest, TestNonModularConfigUpdateRestrictedDelegat
     std::vector<std::vector<std::string>> rows;
     EXPECT_FALSE(dbutils::query(configKey, query.str(), rows, columnTypes, columnNames, err));
     EXPECT_EQ(rows.size(), 0);
-    EXPECT_THAT(err, StartsWith("unable to open database file"));
+    EXPECT_THAT(err, StartsWith("no such table"));
     dbutils::deleteDb(configKey);
 }
 
@@ -901,7 +933,6 @@ TEST_F(RestrictedEventMetricE2eTest, TestEnforceDbGuardrails) {
     EXPECT_THAT(columnTypesResult,
                 ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
 
-    processor->mIsRestrictedMetricsEnabled = false;
     processor->enforceDbGuardrailsIfNecessaryLocked(oneMonthLater, dbEnforcementTimeNs);
 
     EXPECT_FALSE(StorageManager::hasFile(
@@ -937,7 +968,6 @@ TEST_F(RestrictedEventMetricE2eTest, TestEnforceDbGuardrailsDoesNotDeleteBeforeG
     EXPECT_THAT(columnTypesResult,
                 ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
 
-    processor->mIsRestrictedMetricsEnabled = false;
     processor->enforceDbGuardrailsIfNecessaryLocked(oneMonthLater, originalEventElapsedTime);
 
     EXPECT_TRUE(StorageManager::hasFile(
@@ -1137,6 +1167,22 @@ TEST_F(RestrictedEventMetricE2eTest, TestNewRestrictionCategoryEventDeletesTable
                 ElementsAre("atomId", "elapsedTimestampNs", "wallTimestampNs", "field_1"));
     EXPECT_THAT(columnTypesResult,
                 ElementsAre(SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER, SQLITE_INTEGER));
+}
+
+TEST_F(RestrictedEventMetricE2eTest, TestDeviceInfoTableCreated) {
+    std::string query = "SELECT * FROM device_info";
+    processor->querySql(query.c_str(), /*minSqlClientVersion=*/0,
+                        /*policyConfig=*/{}, mockStatsQueryCallback,
+                        /*configKey=*/configId, /*configPackage=*/config_package_name,
+                        /*callingUid=*/delegate_uid);
+    EXPECT_EQ(rowCountResult, 1);
+    EXPECT_THAT(queryDataResult, ElementsAre(_, _, _, _, _, _, _, _, _, _));
+    EXPECT_THAT(columnNamesResult,
+                ElementsAre("sdkVersion", "model", "product", "hardware", "device", "osBuild",
+                            "fingerprint", "brand", "manufacturer", "board"));
+    EXPECT_THAT(columnTypesResult,
+                ElementsAre(SQLITE_INTEGER, SQLITE_TEXT, SQLITE_TEXT, SQLITE_TEXT, SQLITE_TEXT,
+                            SQLITE_TEXT, SQLITE_TEXT, SQLITE_TEXT, SQLITE_TEXT, SQLITE_TEXT));
 }
 #else
 GTEST_LOG_(INFO) << "This test does nothing.\n";

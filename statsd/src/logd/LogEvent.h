@@ -90,9 +90,30 @@ public:
      * should not include the android_log_header_t or the StatsEventTag)
      * \param len size of the buffer
      *
-     * \return success of the initialization
+     * \return success of the parsing
      */
-    bool parseBuffer(uint8_t* buf, size_t len);
+    bool parseBuffer(const uint8_t* buf, size_t len);
+
+    struct BodyBufferInfo {
+        const uint8_t* buffer = nullptr;
+        size_t bufferSize = 0;
+        uint8_t numElements = 0;
+    };
+
+    /**
+     * @brief Parses atom header which consists of atom id, timestamp
+     * and atom level annotations
+     * Updates the value of isValid()
+     * @return BodyBufferInfo to be used for parseBody()
+     */
+    BodyBufferInfo parseHeader(const uint8_t* buf, size_t len);
+
+    /**
+     * @brief Parses atom body which consists of header.numElements elements
+     * Should be called only with BodyBufferInfo if when logEvent.isValid() == true
+     * \return success of the parsing
+     */
+    bool parseBody(const BodyBufferInfo& bodyInfo);
 
     // Constructs a BinaryPushStateChanged LogEvent from API call.
     explicit LogEvent(const std::string& trainName, int64_t trainVersionCode, bool requiresStaging,
@@ -231,6 +252,13 @@ public:
     }
 
     /**
+     * @brief Returns true if only header was parsed
+     */
+    bool isParsedHeaderOnly() const {
+        return mParsedHeaderOnly;
+    }
+
+    /**
      * Only use this if copy is absolutely needed.
      */
     LogEvent(const LogEvent&) = default;
@@ -276,10 +304,12 @@ private:
      * parseBuffer. There are no guarantees about the state of these variables
      * before/after.
      */
-    uint8_t* mBuf;
+    const uint8_t* mBuf;
     uint32_t mRemainingLen; // number of valid bytes left in the buffer being parsed
 
     bool mValid = true; // stores whether the event we received from the socket is valid
+
+    bool mParsedHeaderOnly = false;  // stores whether the only header was parsed skipping the body
 
     /**
      * Side-effects:
@@ -320,9 +350,6 @@ private:
         Value v = Value(value);
         mValues.push_back(FieldValue(f, v));
     }
-
-    uint8_t getTypeId(uint8_t typeInfo);
-    uint8_t getNumAnnotations(uint8_t typeInfo);
 
     // The items are naturally sorted in DFS order as we read them. this allows us to do fast
     // matching.
